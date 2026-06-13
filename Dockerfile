@@ -3,14 +3,14 @@ FROM node:22-alpine AS builder
 
 WORKDIR /app
 
-COPY package*.json .npmrc ./
-RUN --mount=type=secret,id=GITHUB_TOKEN \
-  GITHUB_TOKEN="$(cat /run/secrets/GITHUB_TOKEN)" npm ci
+COPY package*.json ./
+RUN npm ci
 
 COPY tsconfig*.json nest-cli.json ./
 COPY apps ./apps
 COPY libs ./libs
-
+COPY prisma ./prisma
+RUN npx prisma generate
 RUN npm run build:api
 
 FROM node:22-alpine AS runner
@@ -18,11 +18,10 @@ FROM node:22-alpine AS runner
 ENV NODE_ENV=production
 WORKDIR /app
 
-COPY package*.json .npmrc ./
-RUN --mount=type=secret,id=GITHUB_TOKEN \
-  apk upgrade --no-cache zlib \
-  && GITHUB_TOKEN="$(cat /run/secrets/GITHUB_TOKEN)" npm ci --omit=dev \
-  && rm .npmrc package-lock.json \
+COPY package*.json ./
+RUN apk upgrade --no-cache zlib \
+  && npm ci --omit=dev \
+  && rm package-lock.json \
   && addgroup --system --gid 1001 nodejs \
   && adduser --system --uid 1001 nestjs
 

@@ -1,346 +1,163 @@
 /**
  * env.validation.ts
  *
- * Environment variable validation for ConfigModule.
+ * Merged Zod-based environment variable validation for ConfigModule.
+ * Covers all vars from the original template schema and devflow-be's
+ * comprehensive env requirements.
  *
- * Usage in ApiModule or service modules:
- *
+ * Usage in AppModule:
  *   ConfigModule.forRoot({ validate: validateEnv })
- *
- * Design notes:
- *   - Uses a plain validate function — no Joi or class-validator runtime
- *     dependency needed. The check runs once at bootstrap.
- *   - Required vars cause a hard crash (fail-fast). Missing required config
- *     in a running service is a security risk: the service may silently fall
- *     back to insecure defaults.
- *   - Optional vars (API_CENTER_BASE_URL) emit a warning so the developer
- *     knows the feature will be unavailable, but local dev is not broken.
- *
- * Threat addressed:
- *   - Service starting with missing secrets and silently degrading to
- *     insecure fallback behaviour (e.g. empty SUPABASE_SERVICE_ROLE_KEY
- *     allowing unauthenticated DB operations, or no ALLOWED_ORIGINS
- *     causing permissive CORS).
  */
 
-export interface EnvironmentVariables {
-  NODE_ENV: 'development' | 'test' | 'production';
-  PORT: number;
-  ENABLE_SWAGGER: string;
-  SUPABASE_URL?: string;
-  SUPABASE_ANON_KEY?: string;
-  SUPABASE_SERVICE_ROLE_KEY?: string;
-  ALLOWED_ORIGINS: string;
-  API_CENTER_BASE_URL?: string;
-  API_CENTER_API_KEY?: string;
-  API_CENTER_TRIBE_ID?: string;
-  API_CENTER_TRIBE_SECRET?: string;
-  API_CENTER_TIMEOUT_MS?: string;
-}
+import { z } from 'zod';
 
-type RawEnv = Record<string, unknown>;
-const SCOPED_SUPABASE_URL_SUFFIX = '_SUPABASE_URL';
-const SCOPED_SUPABASE_SECRET_SUFFIXES = [
-  '_SUPABASE_SECRET_KEY',
-  '_SUPABASE_SERVICE_ROLE_KEY',
-] as const;
+export const envSchema = z.object({
+  // --- Runtime ---
+  NODE_ENV: z
+    .enum(['development', 'production', 'test'])
+    .optional()
+    .default('development'),
+  PORT: z
+    .string()
+    .optional()
+    .default('3000')
+    .transform((v) => parseInt(v, 10))
+    .pipe(z.number().positive()),
+  ENABLE_SWAGGER: z.string().optional().default('false'),
 
-interface ApiCenterConfig {
-  baseUrl: string | undefined;
-  tribeId: string | undefined;
-  tribeSecret: string | undefined;
-  apiKey: string | undefined;
-  timeoutMs: string | undefined;
-}
+  // --- Database ---
+  DATABASE_URL: z.string().url('DATABASE_URL must be a valid URL'),
 
-function getTrimmedString(env: RawEnv, keys: string[]): string | undefined {
-  for (const key of keys) {
-    const value = env[key];
-    if (typeof value === 'string' && value.trim() !== '') {
-      return value.trim();
-    }
-  }
+  // --- Supabase ---
+  SUPABASE_URL: z.string().url('SUPABASE_URL must be a valid URL'),
+  SUPABASE_ANON_KEY: z.string().optional().default(''),
+  SUPABASE_SERVICE_ROLE_KEY: z.string().optional().default(''),
 
-  return undefined;
-}
+  // --- CORS ---
+  ALLOWED_ORIGINS: z.string(),
+  CORS_ORIGIN: z.string().optional().default('*'),
 
-function resolveApiCenterConfig(env: RawEnv): ApiCenterConfig {
-  return {
-    baseUrl: getTrimmedString(env, ['API_CENTER_BASE_URL', 'APICENTER_URL']),
-    tribeId: getTrimmedString(env, [
-      'API_CENTER_TRIBE_ID',
-      'APICENTER_TRIBE_ID',
-    ]),
-    tribeSecret: getTrimmedString(env, [
-      'API_CENTER_TRIBE_SECRET',
-      'APICENTER_TRIBE_SECRET',
-    ]),
-    apiKey: getTrimmedString(env, ['API_CENTER_API_KEY']),
-    timeoutMs: getTrimmedString(env, [
-      'API_CENTER_TIMEOUT_MS',
-      'APICENTER_TIMEOUT_MS',
-    ]),
-  };
-}
+  // --- Agent / LLM ---
+  AGENT_PROVIDER: z.enum(['mock', 'llm']).optional().default('mock'),
+  LLM_PROVIDER: z
+    .enum(['openrouter', 'openai', 'anthropic', 'opencode', 'gemini'])
+    .optional()
+    .default('openrouter'),
+  LLM_REQUEST_TIMEOUT_MS: z
+    .string()
+    .optional()
+    .default('120000')
+    .transform((v) => parseInt(v, 10))
+    .pipe(z.number().positive()),
+  LLM_CONCURRENCY_LIMIT: z
+    .string()
+    .optional()
+    .default('4')
+    .transform((v) => parseInt(v, 10))
+    .pipe(z.number().positive()),
 
-function extractScopedPrefix(key: string, suffix: string): string | null {
-  if (!key.endsWith(suffix)) {
-    return null;
-  }
+  // --- OpenRouter ---
+  OPENROUTER_API_KEY: z.string().optional().default(''),
+  OPENROUTER_BASE_URL: z
+    .string()
+    .url()
+    .optional()
+    .default('https://openrouter.ai/api/v1'),
+  OPENROUTER_MODEL: z
+    .string()
+    .optional()
+    .default('deepseek/deepseek-v4-flash:free'),
+  OPENROUTER_FALLBACK_MODEL: z.string().optional().default(''),
 
-  const prefix = key.slice(0, -suffix.length);
-  return prefix || null;
-}
+  // --- OpenAI ---
+  OPENAI_API_KEY: z.string().optional().default(''),
+  OPENAI_BASE_URL: z
+    .string()
+    .url()
+    .optional()
+    .default('https://api.openai.com/v1'),
+  OPENAI_MODEL: z.string().optional().default('gpt-4.1-mini'),
+  OPENAI_FALLBACK_MODEL: z.string().optional().default(''),
 
-function getScopedSecretPrefix(key: string): string | null {
-  for (const suffix of SCOPED_SUPABASE_SECRET_SUFFIXES) {
-    const prefix = extractScopedPrefix(key, suffix);
-    if (prefix) {
-      return prefix;
-    }
-  }
+  // --- Anthropic ---
+  ANTHROPIC_API_KEY: z.string().optional().default(''),
+  ANTHROPIC_BASE_URL: z
+    .string()
+    .url()
+    .optional()
+    .default('https://api.anthropic.com/v1'),
+  ANTHROPIC_MODEL: z.string().optional().default('claude-3-5-haiku-20241022'),
+  ANTHROPIC_FALLBACK_MODEL: z.string().optional().default(''),
+  ANTHROPIC_VERSION: z.string().optional().default('2023-06-01'),
 
-  return null;
-}
+  // --- OpenCode ---
+  OPENCODE_API_KEY: z.string().optional().default(''),
+  OPENCODE_BASE_URL: z
+    .string()
+    .url()
+    .optional()
+    .default('https://opencode.ai/zen/go/v1'),
+  OPENCODE_MODEL: z.string().optional().default('deepseek-v4-flash'),
+  OPENCODE_FALLBACK_MODEL: z.string().optional().default(''),
 
-function collectScopedSupabasePrefixSets(env: RawEnv): {
-  urlPrefixes: Set<string>;
-  secretPrefixes: Set<string>;
-} {
-  const urlPrefixes = new Set<string>();
-  const secretPrefixes = new Set<string>();
+  // --- Gemini ---
+  GEMINI_API_KEY: z.string().optional().default(''),
+  GEMINI_BASE_URL: z
+    .string()
+    .url()
+    .optional()
+    .default(
+      'https://generativelanguage.googleapis.com/v1beta/openai',
+    ),
+  GEMINI_MODEL: z.string().optional().default('gemini-3.5-flash'),
+  GEMINI_FALLBACK_MODEL: z.string().optional().default(''),
 
-  for (const [key, raw] of Object.entries(env)) {
-    if (typeof raw !== 'string' || raw.trim() === '') {
-      continue;
-    }
+  // --- GitHub ---
+  GITHUB_APP_ID: z.string().optional().default(''),
+  GITHUB_PRIVATE_KEY: z.string().optional().default(''),
+  GITHUB_INSTALLATION_ID: z.string().optional().default(''),
+  GITHUB_ORG: z.string().optional().default(''),
 
-    const urlPrefix = extractScopedPrefix(key, SCOPED_SUPABASE_URL_SUFFIX);
-    if (urlPrefix) {
-      urlPrefixes.add(urlPrefix);
-    }
+  // --- LangChain / LangSmith ---
+  LANGCHAIN_API_KEY: z.string().optional(),
+  LANGCHAIN_TRACING_V2: z
+    .enum(['true', 'false'])
+    .optional()
+    .default('false'),
+  LANGCHAIN_PROJECT: z.string().optional().default('devflow'),
 
-    const secretPrefix = getScopedSecretPrefix(key);
-    if (secretPrefix) {
-      secretPrefixes.add(secretPrefix);
-    }
-  }
+  // --- Supervisor ---
+  SUPERVISOR_POLL_INTERVAL_MS: z
+    .string()
+    .optional()
+    .default('30000')
+    .transform((v) => parseInt(v, 10))
+    .pipe(z.number().positive()),
+  SUPERVISOR_STUCK_THRESHOLD_MS: z
+    .string()
+    .optional()
+    .default('300000')
+    .transform((v) => parseInt(v, 10))
+    .pipe(z.number().positive()),
+});
 
-  return { urlPrefixes, secretPrefixes };
-}
+export type EnvSchema = z.infer<typeof envSchema>;
 
-function countScopedSupabaseClients(env: RawEnv): number {
-  const { urlPrefixes, secretPrefixes } = collectScopedSupabasePrefixSets(env);
-
-  let count = 0;
-  for (const prefix of urlPrefixes) {
-    if (secretPrefixes.has(prefix)) {
-      count += 1;
-    }
-  }
-
-  return count;
-}
-
-function warnApiCenterConfig(config: ApiCenterConfig): void {
-  if (!config.baseUrl) {
-    console.warn(
-      '[env] WARNING: API_CENTER_BASE_URL/APICENTER_URL is not set. Calls to APICenter will fail at runtime.',
-    );
-  }
-
-  if (!config.apiKey) {
-    console.warn(
-      '[env] WARNING: API_CENTER_API_KEY is not set. Legacy fallback disabled; prefer tribe credentials.',
-    );
-  }
-
-  if (config.tribeId && !config.tribeSecret) {
-    console.warn(
-      '[env] WARNING: API_CENTER_TRIBE_ID is set but API_CENTER_TRIBE_SECRET is missing. Tribe token flow will not work.',
-    );
-  }
-
-  if (config.tribeSecret && !config.tribeId) {
-    console.warn(
-      '[env] WARNING: API_CENTER_TRIBE_SECRET is set but API_CENTER_TRIBE_ID is missing. Tribe token flow will not work.',
-    );
-  }
-}
-
-function validateApiCenterTimeout(config: ApiCenterConfig): void {
-  if (!config.timeoutMs) {
-    return;
-  }
-
-  const parsed = Number(config.timeoutMs);
-  if (!Number.isFinite(parsed) || parsed <= 0) {
-    throw new Error(
-      `[env] API_CENTER_TIMEOUT_MS must be a positive number when set. Got: '${config.timeoutMs}'.`,
-    );
-  }
-}
-
-function validateProductionApiCenter(config: ApiCenterConfig): void {
-  if (!config.baseUrl) {
-    throw new Error(
-      '[env] API_CENTER_BASE_URL (or APICENTER_URL) is required in production.',
-    );
-  }
-
-  const hasTribeAuth = Boolean(config.tribeId && config.tribeSecret);
-  const hasLegacyAuth = Boolean(config.apiKey);
-
-  if (!hasTribeAuth && !hasLegacyAuth) {
-    throw new Error(
-      '[env] Production APICenter auth is missing. Set API_CENTER_TRIBE_ID + API_CENTER_TRIBE_SECRET (preferred) or API_CENTER_API_KEY (legacy).',
-    );
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Internal helpers
-// ---------------------------------------------------------------------------
-
-function requireString(env: RawEnv, key: string): string {
-  const value = env[key];
-  if (typeof value !== 'string' || value.trim() === '') {
-    throw new Error(
-      `[env] Missing required environment variable: ${key}. ` +
-        `Set it in .env or your deployment secrets before starting the service.`,
-    );
-  }
-  return value.trim();
-}
-
-function requireEnum<T extends string>(
-  env: RawEnv,
-  key: string,
-  allowed: readonly T[],
-): T {
-  const raw = requireString(env, key);
-  if (!allowed.includes(raw as T)) {
-    throw new Error(
-      `[env] Invalid value for ${key}: '${raw}'. ` +
-        `Allowed values: ${allowed.join(', ')}.`,
-    );
-  }
-  return raw as T;
-}
-
-function requirePort(env: RawEnv, key: string): number {
-  const raw = env[key];
-  const parsed = Number(raw);
-  if (!Number.isInteger(parsed) || parsed < 1 || parsed > 65535) {
-    throw new Error(
-      `[env] ${key} must be an integer between 1 and 65535. Got: '${String(raw)}'.`,
-    );
-  }
-  return parsed;
-}
-
-// ---------------------------------------------------------------------------
-// Exported validate function
-// ---------------------------------------------------------------------------
+/** Backward-compatible alias */
+export type EnvironmentVariables = EnvSchema;
 
 /**
  * validateEnv — passed directly to ConfigModule.forRoot({ validate }).
- *
  * Called by NestJS at bootstrap with the raw process.env object.
  * Must return the parsed/typed config or throw to abort startup.
  */
-export function validateEnv(env: RawEnv): EnvironmentVariables {
-  // --- Required: service identity ---
-  const NODE_ENV = requireEnum(env, 'NODE_ENV', [
-    'development',
-    'test',
-    'production',
-  ] as const);
-
-  const PORT = requirePort(env, 'PORT');
-
-  const SUPABASE_URL = getTrimmedString(env, ['SUPABASE_URL']);
-  const SUPABASE_ANON_KEY = getTrimmedString(env, ['SUPABASE_ANON_KEY']);
-  const SUPABASE_SERVICE_ROLE_KEY = getTrimmedString(env, [
-    'SUPABASE_SERVICE_ROLE_KEY',
-  ]);
-
-  const scopedSupabaseClientCount = countScopedSupabaseClients(env);
-
-  const defaultSupabaseValues = {
-    SUPABASE_URL,
-    SUPABASE_ANON_KEY,
-    SUPABASE_SERVICE_ROLE_KEY,
-  };
-
-  const missingDefaultSupabaseKeys = Object.entries(defaultSupabaseValues)
-    .filter(([, value]) => !value)
-    .map(([key]) => key);
-
-  if (
-    missingDefaultSupabaseKeys.length === 3 &&
-    scopedSupabaseClientCount === 0
-  ) {
-    throw new Error(
-      '[env] Missing Supabase configuration. Provide SUPABASE_URL + SUPABASE_ANON_KEY + SUPABASE_SERVICE_ROLE_KEY, or define at least one scoped client pair (<SERVICE>_SUPABASE_URL + <SERVICE>_SUPABASE_SECRET_KEY).',
-    );
+export function validateEnv(config: Record<string, unknown>): EnvSchema {
+  const result = envSchema.safeParse(config);
+  if (!result.success) {
+    const formatted = result.error.errors
+      .map((e) => `${e.path.join('.')}: ${e.message}`)
+      .join(', ');
+    throw new Error(`Environment validation failed: ${formatted}`);
   }
-
-  if (
-    missingDefaultSupabaseKeys.length > 0 &&
-    missingDefaultSupabaseKeys.length < 3
-  ) {
-    if (scopedSupabaseClientCount === 0) {
-      throw new Error(
-        `[env] Incomplete default Supabase configuration. Missing: ${missingDefaultSupabaseKeys.join(', ')}.`,
-      );
-    }
-
-    console.warn(
-      `[env] WARNING: Default SUPABASE_* config is incomplete (${missingDefaultSupabaseKeys.join(', ')}). Proceeding with scoped service clients only.`,
-    );
-  }
-
-  // --- Required: CORS ---
-  // ALLOWED_ORIGINS must be set; corsOptions() will deny all browser-origin
-  // requests if empty, which may cause confusing CORS errors in staging.
-  // We require it here so misconfiguration is explicit at startup.
-  const ALLOWED_ORIGINS = requireString(env, 'ALLOWED_ORIGINS');
-
-  // --- Optional with warnings ---
-  const ENABLE_SWAGGER =
-    (env['ENABLE_SWAGGER'] as string | undefined) ?? 'false';
-
-  const apiCenterConfig = resolveApiCenterConfig(env);
-  warnApiCenterConfig(apiCenterConfig);
-  validateApiCenterTimeout(apiCenterConfig);
-
-  if (NODE_ENV === 'production') {
-    validateProductionApiCenter(apiCenterConfig);
-  }
-
-  return {
-    NODE_ENV,
-    PORT,
-    ENABLE_SWAGGER,
-    ...(SUPABASE_URL ? { SUPABASE_URL } : {}),
-    ...(SUPABASE_ANON_KEY ? { SUPABASE_ANON_KEY } : {}),
-    ...(SUPABASE_SERVICE_ROLE_KEY ? { SUPABASE_SERVICE_ROLE_KEY } : {}),
-    ALLOWED_ORIGINS,
-    ...(apiCenterConfig.baseUrl
-      ? { API_CENTER_BASE_URL: apiCenterConfig.baseUrl }
-      : {}),
-    ...(apiCenterConfig.apiKey
-      ? { API_CENTER_API_KEY: apiCenterConfig.apiKey }
-      : {}),
-    ...(apiCenterConfig.tribeId
-      ? { API_CENTER_TRIBE_ID: apiCenterConfig.tribeId }
-      : {}),
-    ...(apiCenterConfig.tribeSecret
-      ? { API_CENTER_TRIBE_SECRET: apiCenterConfig.tribeSecret }
-      : {}),
-    ...(apiCenterConfig.timeoutMs
-      ? { API_CENTER_TIMEOUT_MS: apiCenterConfig.timeoutMs }
-      : {}),
-  };
+  return result.data;
 }

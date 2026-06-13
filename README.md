@@ -1,6 +1,6 @@
 # Tribe Backend Template — NestJS
 
-Reusable NestJS 11 backend template for ImplementSprint tribes. Each tribe clones this repository as their backend service. It comes pre-wired with Supabase, the API Center SDK, security middleware, CI/CD, and Docker — ready to extend with tribe-specific feature modules.
+NestJS 11 monorepo backend for DevFlow — standalone REST and WebSocket API, deployed directly to Render.
 
 Start with `START_HERE_BACKEND.md` for a full onboarding and system-level explanation.
 
@@ -10,8 +10,8 @@ Start with `START_HERE_BACKEND.md` for a full onboarding and system-level explan
 
 - **Production-ready bootstrap** — Helmet, CORS, body size limits, graceful shutdown, global validation, structured error responses, and Swagger (toggled by env var).
 - **Supabase integration** — pre-wired `SupabaseService` with connection health check.
-- **API Center SDK** — pre-wired `ApiCenterSdkService` for calling the shared API gateway and registering this tribe's own APIs.
-- **Correlation ID propagation** — every request gets an `X-Correlation-ID` header, linking tribe backend logs to API Center traces.
+- **Standalone deployment** — exposes REST/WS API directly, no central gateway required.
+- **Correlation ID propagation** — every request gets an `X-Correlation-ID` header for distributed tracing.
 - **TypeScript strict mode** — `strict`, `noImplicitAny`, `noUncheckedIndexedAccess`, `exactOptionalPropertyTypes`, `module: nodenext`.
 - **CI/CD pipeline** — caller workflow delegates to the central `master-pipeline-be.yml` orchestrator (test → uat → main promotion with quality gates, SonarCloud, k6, Docker build).
 - **Non-root Docker container** — multi-stage Node 22 alpine build with a least-privilege `nestjs` user.
@@ -26,7 +26,6 @@ Start with `START_HERE_BACKEND.md` for a full onboarding and system-level explan
 | Runtime | Node.js 22 LTS |
 | Language | TypeScript 5 (strict mode) |
 | Database | Supabase (PostgreSQL via `@supabase/supabase-js`) |
-| API Gateway | ImplementSprint API Center (via internal SDK) |
 | Testing | Jest + Supertest |
 | Linting | ESLint + TypeScript ESLint + Prettier |
 | CI/CD | GitHub Actions → central-workflow |
@@ -40,7 +39,7 @@ Start with `START_HERE_BACKEND.md` for a full onboarding and system-level explan
 
 ```bash
 cp .env.example .env
-# Fill in your Supabase and API Center credentials in .env
+# Fill in your Supabase and LLM provider credentials in .env
 
 npm install
 npm run start:dev
@@ -74,13 +73,8 @@ Copy `.env.example` to `.env` and fill in real values. Never commit `.env`.
 | `<SERVICE>_SUPABASE_SECRET_KEY` | Optional | Service-scoped Supabase service key (paired with `<SERVICE>_SUPABASE_URL`) |
 | `<SERVICE>_SUPABASE_SERVICE_ROLE_KEY` | Optional | Alias for service-scoped secret key |
 | `ALLOWED_ORIGINS` | Yes | Comma-separated CORS origins (e.g. `http://localhost:5173`) |
-| `API_CENTER_BASE_URL` | Required in production | API Center gateway URL (alias accepted: `APICENTER_URL`) |
-| `API_CENTER_TRIBE_ID` | Required in production (preferred) | APICenter auth mode: registered tribe/service id (alias accepted: `APICENTER_TRIBE_ID`) |
-| `API_CENTER_TRIBE_SECRET` | Required in production (preferred) | Secret paired with `API_CENTER_TRIBE_ID` (alias accepted: `APICENTER_TRIBE_SECRET`) |
-| `API_CENTER_API_KEY` | Optional (legacy fallback) | Legacy static bearer token mode |
-| `API_CENTER_TIMEOUT_MS` | Optional | APICenter HTTP timeout in ms (default `10000`, alias accepted: `APICENTER_TIMEOUT_MS`) |
 
-`SUPABASE_SERVICE_ROLE_KEY`, `API_CENTER_TRIBE_SECRET`, and `API_CENTER_API_KEY` are **HIGH sensitivity** — store them in GitHub Secrets or Vault, never in plaintext files committed to version control.
+`SUPABASE_SERVICE_ROLE_KEY` is **HIGH sensitivity** — store it in GitHub Secrets or Vault, never in plaintext files committed to version control.
 
 ### Strict Env Validation
 
@@ -99,14 +93,7 @@ apps/
       api.controller.ts             GET /api/v1 -> { service, version }
       health/                       GET /api/v1/health
     Dockerfile
-  location-service/
-    src/
-      main.ts                       TCP microservice bootstrap
-      location-service.module.ts    Domain service module
-      location/                     MessagePattern handlers
-    Dockerfile
 libs/
-  api-center/                       Global TribeClient provider and registration service
   common/                           Config, security, filters, middleware, seed data
   contracts/                        Shared message patterns and payload contracts
   supabase/                         Supabase module/service
@@ -114,7 +101,6 @@ tests/
   e2e/                              Supertest e2e specs for the HTTP API
   performance/
     api-smoke.js                    k6 smoke test targeting /api/v1/health
-    location-service-smoke.js       service smoke placeholder for deployed health URL
 ```
 
 ---
@@ -131,53 +117,17 @@ Response when healthy:
   "status": "ok",
   "uptimeSeconds": 42,
   "checks": {
-    "database": true,
-    "apiCenter": true
+    "database": true
   }
 }
 ```
 
 | `status` | HTTP | Meaning |
 |----------|------|---------|
-| `ok` | 200 | Both Supabase and API Center are reachable |
-| `degraded` | 200 | One dependency is unreachable — service is still running |
-| `error` | 503 | Both dependencies are unreachable |
+| `ok` | 200 | Database is reachable |
+| `error` | 503 | Database is unreachable |
 
 The Docker container healthcheck targets this endpoint.
-
----
-
-## API Center SDK
-
-The `ApiCenterSdkService` is the authorized channel for calling the shared API gateway. Any feature module can inject it:
-
-- Preferred auth mode: `API_CENTER_TRIBE_ID` + `API_CENTER_TRIBE_SECRET` (short-lived token lifecycle)
-- Legacy fallback mode: `API_CENTER_API_KEY` (deprecated static bearer token)
-- Paths for APICenter namespaces (`/tribes`, `/shared`, `/external`, `/auth`, `/registry`, `/health`) are normalized to `/api/v1/...` automatically
-- Typed Kafka helpers are available: `kafkaListClusters()`, `kafkaListTopics(clusterId)`, `kafkaProduceRecords(clusterId, topic, records)`, and `buildTenantTopic(tribeId, suffix)`
-
-```typescript
-constructor(private readonly sdkService: ApiCenterSdkService) {}
-
-// Consume another tribe's registered API
-const { data, correlationId } = await this.sdkService.get<User[]>('/tribes/tribe-b/users');
-
-// Consume a shared external service registered in the API Center
-const { data } = await this.sdkService.get('/shared/payment/invoice/123');
-
-// Kafka through APICenter external routing
-const topic = ApiCenterSdkService.buildTenantTopic('orders-service', 'order-created');
-await this.sdkService.kafkaProduceRecords('lkc-123', topic, [
-  {
-    key: 'order-001',
-    value: JSON.stringify({ orderId: 'order-001', status: 'created' }),
-  },
-]);
-```
-
-If `API_CENTER_BASE_URL` is not set, the service logs a warning at startup and all calls throw — it does not crash the application.
-
-Service registration is available through `registerServiceManifest(...)` in `ApiCenterSdkService` for startup registration to `POST /api/v1/registry/register`.
 
 ---
 
@@ -250,19 +200,6 @@ Example:
     "build_command": "npm run build:api",
     "dockerfile_path": "apps/api/Dockerfile",
     "k6_script_path": "tests/performance/api-smoke.js"
-  },
-  {
-    "name": "my-location-service",
-    "dir": ".",
-    "install_dir": ".",
-    "project": "location-service",
-    "image": "ghcr.io/org/my-location-service",
-    "backend_stack": "nestjs",
-    "version_stream": "location-service",
-    "test_command": "npm run test:cov -- --selectProjects location-service",
-    "build_command": "npm run build:location-service",
-    "dockerfile_path": "apps/location-service/Dockerfile",
-    "k6_script_path": "tests/performance/location-service-smoke.js"
   }
 ]
 ```
@@ -299,7 +236,7 @@ Example:
 7. **Versioning** — semantic version tag per branch
 8. **Promotion** — auto-creates PR to next branch when required quality gates pass
   - branch mapping: `test` -> test, `uat` -> uat, `main` -> main
-  - deployment passes only when health endpoint returns `checks.apiCenter=true`
+  - deployment passes only when health endpoint returns `checks.database=true`
 
 ---
 
@@ -312,7 +249,7 @@ This template now uses Render for backend deployments through the central reusab
 1. The caller workflow delegates deployment to `master-pipeline-be.yml` and keeps deploy lanes enabled on push.
 2. The central `render-deploy` reusable lane runs on `test`, `uat`, and `main` branches.
 3. The lane triggers the branch-specific Render deploy hook.
-4. The lane polls the configured health endpoint and requires `checks.apiCenter=true` before passing.
+4. The lane polls the configured health endpoint and requires `checks.database=true` before passing.
 
 ### Setup
 
@@ -329,11 +266,8 @@ This template now uses Render for backend deployments through the central reusab
   - `RENDER_DEPLOY_HOOK_URL`
   - `RENDER_HEALTHCHECK_URL`
 5. Configure Render runtime environment variables (same set as `.env.example`).
-  - Ensure APICenter values are present in production lanes so `checks.apiCenter=true` health validation passes.
-6. Set APICenter auth mode:
-  - Preferred: `API_CENTER_TRIBE_ID` + `API_CENTER_TRIBE_SECRET`
-  - Legacy fallback only: `API_CENTER_API_KEY`
-7. Set `NODE_ENV=production` and `ENABLE_SWAGGER=false` in Render.
+  - Set `DATABASE_URL`, `SUPABASE_URL`, and your LLM provider keys.
+6. Set `NODE_ENV=production` and `ENABLE_SWAGGER=false` in Render.
 
 > **CORS note:** The CORS factory uses exact-match whitelisting. Set `ALLOWED_ORIGINS` to your exact frontend URLs for each environment.
 
@@ -377,9 +311,11 @@ All new feature modules must pass `npm run typecheck` with zero errors. Use type
 If your tribe already has a NestJS backend, migrate toward this workspace shape:
 
 1. **Adopt the workspace layout** - keep deployable runtimes under `apps/*` and shared modules under `libs/*`.
-2. **Copy the shared libraries** - `libs/common`, `libs/api-center`, `libs/supabase`, and `libs/contracts`.
+2. **Copy the shared libraries** - `libs/common`, `libs/supabase`, and `libs/contracts`.
 3. **Wire HTTP modules through `apps/api/src/api.module.ts`** - import shared modules and any tribe domain modules needed by the API.
 4. **Add new microservices under `apps/<domain>-service`** - expose message contracts from `libs/contracts`.
 5. **Replace the CI caller** - use `.github/workflows/be-pipeline-caller.yml` from this template.
-6. **Configure GitHub** - set `BACKEND_MULTI_SYSTEMS_JSON`, GitHub Packages access, and the repository secrets listed above.
-7. **Set runtime env** - Supabase credentials, API Center URL, tribe credentials, CORS origins, and per-service ports.
+6. **Configure GitHub** - set `BACKEND_MULTI_SYSTEMS_JSON` and the repository secrets listed above.
+7. **Set runtime env** - Supabase credentials, LLM provider keys, CORS origins, and per-service ports.
+
+DevFlow is deployed directly to Render. Set `DATABASE_URL`, `SUPABASE_URL`, and your LLM provider keys in Render environment variables.

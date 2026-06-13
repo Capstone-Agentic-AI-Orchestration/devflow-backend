@@ -20,7 +20,7 @@ describe('ApiService', () => {
   describe('getServiceInfo', () => {
     it('returns the correct service name', () => {
       const info = service.getServiceInfo();
-      expect(info.service).toBe('tribe-backend');
+      expect(info.service).toBe('devflow-backend');
     });
 
     it('returns the correct version', () => {
@@ -30,7 +30,7 @@ describe('ApiService', () => {
 
     it('returns an object with both service and version keys', () => {
       const info = service.getServiceInfo();
-      expect(info).toEqual({ service: 'tribe-backend', version: '1.0.0' });
+      expect(info).toEqual({ service: 'devflow-backend', version: '1.0.0' });
     });
   });
 });

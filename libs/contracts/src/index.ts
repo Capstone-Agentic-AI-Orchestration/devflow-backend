@@ -1,1 +1,1 @@
-export * from './location.patterns';
+// no exports

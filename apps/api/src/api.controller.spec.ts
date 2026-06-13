@@ -4,23 +4,29 @@ import { ApiController } from './api.controller';
 import { ApiService } from './api.service';
 
 describe('ApiController', () => {
-  let apiController: ApiController;
+  let controller: ApiController;
 
   beforeEach(async () => {
-    const app: TestingModule = await Test.createTestingModule({
+    const module: TestingModule = await Test.createTestingModule({
       controllers: [ApiController],
       providers: [ApiService],
     }).compile();
 
-    apiController = app.get<ApiController>(ApiController);
+    controller = module.get<ApiController>(ApiController);
   });
 
-  describe('root', () => {
-    it('should return service info', () => {
-      expect(apiController.getServiceInfo()).toEqual({
-        service: 'tribe-backend',
-        version: '1.0.0',
-      });
-    });
+  it('should be defined', () => {
+    expect(controller).toBeDefined();
+  });
+
+  it('getServiceInfo returns devflow-backend identity', () => {
+    const result = controller.getServiceInfo();
+    expect(result.service).toBe('devflow-backend');
+    expect(result.version).toBe('1.0.0');
+  });
+
+  it('getServiceInfo returns a well-formed ServiceInfo object', () => {
+    const result = controller.getServiceInfo();
+    expect(result).toEqual({ service: 'devflow-backend', version: '1.0.0' });
   });
 });

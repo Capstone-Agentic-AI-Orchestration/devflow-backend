@@ -19,15 +19,6 @@
         "tsConfigPath": "apps/api/tsconfig.app.json"
       }
     },
-    "location-service": {
-      "type": "application",
-      "root": "apps/location-service",
-      "entryFile": "main",
-      "sourceRoot": "apps/location-service/src",
-      "compilerOptions": {
-        "tsConfigPath": "apps/location-service/tsconfig.app.json"
-      }
-    },
     "common": {
       "type": "library",
       "root": "libs/common",
@@ -35,15 +26,6 @@
       "sourceRoot": "libs/common/src",
       "compilerOptions": {
         "tsConfigPath": "libs/common/tsconfig.lib.json"
-      }
-    },
-    "api-center": {
-      "type": "library",
-      "root": "libs/api-center",
-      "entryFile": "index",
-      "sourceRoot": "libs/api-center/src",
-      "compilerOptions": {
-        "tsConfigPath": "libs/api-center/tsconfig.lib.json"
       }
     },
     "supabase": {
@@ -62,6 +44,15 @@
       "sourceRoot": "libs/contracts/src",
       "compilerOptions": {
         "tsConfigPath": "libs/contracts/tsconfig.lib.json"
+      }
+    },
+    "prisma": {
+      "type": "library",
+      "root": "libs/prisma",
+      "entryFile": "index",
+      "sourceRoot": "libs/prisma/src",
+      "compilerOptions": {
+        "tsConfigPath": "libs/prisma/tsconfig.lib.json"
       }
     }
   }

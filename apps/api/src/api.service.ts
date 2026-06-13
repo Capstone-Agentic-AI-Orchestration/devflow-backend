@@ -8,6 +8,6 @@ export interface ServiceInfo {
 @Injectable()
 export class ApiService {
   getServiceInfo(): ServiceInfo {
-    return { service: 'tribe-backend', version: '1.0.0' };
+    return { service: 'devflow-backend', version: '1.0.0' };
   }
 }

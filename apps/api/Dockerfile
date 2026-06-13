@@ -10,7 +10,8 @@ RUN --mount=type=secret,id=GITHUB_TOKEN \
 COPY tsconfig*.json nest-cli.json ./
 COPY apps ./apps
 COPY libs ./libs
-
+COPY prisma ./prisma
+RUN npx prisma generate
 RUN npm run build:api
 
 FROM node:22-alpine AS runner

@@ -28,12 +28,12 @@
     "paths": {
       "@app/common": ["libs/common/src"],
       "@app/common/*": ["libs/common/src/*"],
-      "@app/api-center": ["libs/api-center/src"],
-      "@app/api-center/*": ["libs/api-center/src/*"],
       "@app/supabase": ["libs/supabase/src"],
       "@app/supabase/*": ["libs/supabase/src/*"],
       "@app/contracts": ["libs/contracts/src"],
-      "@app/contracts/*": ["libs/contracts/src/*"]
+      "@app/contracts/*": ["libs/contracts/src/*"],
+      "@app/prisma": ["libs/prisma/src"],
+      "@app/prisma/*": ["libs/prisma/src/*"]
     }
   }
 }

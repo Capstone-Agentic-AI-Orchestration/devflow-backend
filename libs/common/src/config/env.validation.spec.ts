@@ -4,16 +4,17 @@ import { validateEnv } from './env.validation';
 // Helpers
 // ---------------------------------------------------------------------------
 
+/**
+ * Minimal valid env — contains all REQUIRED fields plus key optional fields.
+ * All tests start from this baseline and override individual fields.
+ */
 function validEnv(
   overrides: Record<string, unknown> = {},
 ): Record<string, unknown> {
   return {
-    NODE_ENV: 'development',
-    PORT: '3000',
+    DATABASE_URL: 'postgresql://user:pass@localhost:5432/devflow_test',
     SUPABASE_URL: 'https://abc.supabase.co',
-    SUPABASE_ANON_KEY: 'anon-key',
-    SUPABASE_SERVICE_ROLE_KEY: 'service-role-key',
-    ALLOWED_ORIGINS: 'http://localhost:5173',
+    ALLOWED_ORIGINS: 'http://localhost:3001',
     ...overrides,
   };
 }
@@ -23,282 +24,249 @@ function validEnv(
 // ---------------------------------------------------------------------------
 
 describe('validateEnv', () => {
-  describe('happy path', () => {
-    it('returns a fully typed config object for a valid env', () => {
+  // ── required fields ────────────────────────────────────────────────────────
+
+  describe('DATABASE_URL', () => {
+    it('throws when DATABASE_URL is missing', () => {
+      const env = validEnv();
+      delete env['DATABASE_URL'];
+      expect(() => validateEnv(env)).toThrow(/DATABASE_URL/);
+    });
+
+    it('throws when DATABASE_URL is not a valid URL', () => {
+      expect(() => validateEnv(validEnv({ DATABASE_URL: 'not-a-url' }))).toThrow(
+        /DATABASE_URL/,
+      );
+    });
+
+    it('accepts a valid postgresql:// DATABASE_URL', () => {
       const result = validateEnv(validEnv());
-
-      expect(result.NODE_ENV).toBe('development');
-      expect(result.PORT).toBe(3000);
-      expect(result.SUPABASE_URL).toBe('https://abc.supabase.co');
-      expect(result.SUPABASE_ANON_KEY).toBe('anon-key');
-      expect(result.SUPABASE_SERVICE_ROLE_KEY).toBe('service-role-key');
-      expect(result.ALLOWED_ORIGINS).toBe('http://localhost:5173');
-    });
-
-    it('accepts production as NODE_ENV', () => {
-      const result = validateEnv(
-        validEnv({
-          NODE_ENV: 'production',
-          API_CENTER_BASE_URL: 'http://api-center.local',
-          API_CENTER_TRIBE_ID: 'tribe-a',
-          API_CENTER_TRIBE_SECRET: 'tribe-secret',
-        }),
+      expect(result.DATABASE_URL).toBe(
+        'postgresql://user:pass@localhost:5432/devflow_test',
       );
-      expect(result.NODE_ENV).toBe('production');
+    });
+  });
+
+  describe('SUPABASE_URL', () => {
+    it('throws when SUPABASE_URL is missing', () => {
+      const env = validEnv();
+      delete env['SUPABASE_URL'];
+      expect(() => validateEnv(env)).toThrow(/SUPABASE_URL/);
     });
 
-    it('accepts test as NODE_ENV', () => {
-      const result = validateEnv(validEnv({ NODE_ENV: 'test' }));
-      expect(result.NODE_ENV).toBe('test');
-    });
-
-    it('includes optional API_CENTER_BASE_URL when provided', () => {
-      const result = validateEnv(
-        validEnv({ API_CENTER_BASE_URL: 'http://api-center.local' }),
+    it('throws when SUPABASE_URL is not a valid URL', () => {
+      expect(() => validateEnv(validEnv({ SUPABASE_URL: 'not-a-url' }))).toThrow(
+        /SUPABASE_URL/,
       );
-      expect(result.API_CENTER_BASE_URL).toBe('http://api-center.local');
     });
 
-    it('includes optional API_CENTER_API_KEY when provided', () => {
-      const result = validateEnv(
-        validEnv({
-          API_CENTER_BASE_URL: 'http://api-center.local',
-          API_CENTER_API_KEY: 'secret-key',
-        }),
-      );
-      expect(result.API_CENTER_API_KEY).toBe('secret-key');
-    });
-
-    it('includes optional API_CENTER_TRIBE_ID and API_CENTER_TRIBE_SECRET when provided', () => {
-      const result = validateEnv(
-        validEnv({
-          API_CENTER_TRIBE_ID: 'tribe-a',
-          API_CENTER_TRIBE_SECRET: 'tribe-secret',
-        }),
-      );
-
-      expect(result.API_CENTER_TRIBE_ID).toBe('tribe-a');
-      expect(result.API_CENTER_TRIBE_SECRET).toBe('tribe-secret');
-    });
-
-    it('includes optional API_CENTER_TIMEOUT_MS when provided', () => {
-      const result = validateEnv(validEnv({ API_CENTER_TIMEOUT_MS: '8000' }));
-      expect(result.API_CENTER_TIMEOUT_MS).toBe('8000');
-    });
-
-    it('accepts APICENTER_* aliases', () => {
-      const result = validateEnv(
-        validEnv({
-          APICENTER_URL: 'http://api-center.local',
-          APICENTER_TRIBE_ID: 'tribe-a',
-          APICENTER_TRIBE_SECRET: 'tribe-secret',
-          APICENTER_TIMEOUT_MS: '5000',
-        }),
-      );
-
-      expect(result.API_CENTER_BASE_URL).toBe('http://api-center.local');
-      expect(result.API_CENTER_TRIBE_ID).toBe('tribe-a');
-      expect(result.API_CENTER_TRIBE_SECRET).toBe('tribe-secret');
-      expect(result.API_CENTER_TIMEOUT_MS).toBe('5000');
-    });
-
-    it('accepts scoped Supabase-only config without default SUPABASE_* trio', () => {
-      const result = validateEnv(
-        validEnv({
-          SUPABASE_URL: undefined,
-          SUPABASE_ANON_KEY: undefined,
-          SUPABASE_SERVICE_ROLE_KEY: undefined,
-          PAYMENT_SERVICE_SUPABASE_URL: 'https://payment.supabase.co',
-          PAYMENT_SERVICE_SUPABASE_SECRET_KEY: 'payment-secret',
-        }),
-      );
-
-      expect(result.SUPABASE_URL).toBeUndefined();
-      expect(result.SUPABASE_ANON_KEY).toBeUndefined();
-      expect(result.SUPABASE_SERVICE_ROLE_KEY).toBeUndefined();
-    });
-
-    it('accepts incomplete default SUPABASE_* when scoped clients are configured', () => {
-      const result = validateEnv(
-        validEnv({
-          SUPABASE_ANON_KEY: undefined,
-          PAYMENT_SERVICE_SUPABASE_URL: 'https://payment.supabase.co',
-          PAYMENT_SERVICE_SUPABASE_SECRET_KEY: 'payment-secret',
-        }),
-      );
-
-      expect(result.SUPABASE_URL).toBe('https://abc.supabase.co');
-      expect(result.SUPABASE_ANON_KEY).toBeUndefined();
-      expect(result.SUPABASE_SERVICE_ROLE_KEY).toBe('service-role-key');
-    });
-
-    it('omits API_CENTER_BASE_URL from result when not set', () => {
+    it('accepts a valid https:// SUPABASE_URL', () => {
       const result = validateEnv(validEnv());
-      expect(result.API_CENTER_BASE_URL).toBeUndefined();
-    });
-
-    it('defaults ENABLE_SWAGGER to "false" when not set', () => {
-      const result = validateEnv(validEnv());
-      expect(result.ENABLE_SWAGGER).toBe('false');
-    });
-
-    it('uses the provided ENABLE_SWAGGER value when set', () => {
-      const result = validateEnv(validEnv({ ENABLE_SWAGGER: 'true' }));
-      expect(result.ENABLE_SWAGGER).toBe('true');
-    });
-
-    it('trims leading/trailing whitespace from string values', () => {
-      const result = validateEnv(
-        validEnv({ SUPABASE_URL: '  https://abc.supabase.co  ' }),
-      );
       expect(result.SUPABASE_URL).toBe('https://abc.supabase.co');
     });
   });
 
-  describe('NODE_ENV validation', () => {
+  describe('ALLOWED_ORIGINS', () => {
+    it('throws when ALLOWED_ORIGINS is missing', () => {
+      const env = validEnv();
+      delete env['ALLOWED_ORIGINS'];
+      expect(() => validateEnv(env)).toThrow(/ALLOWED_ORIGINS/);
+    });
+
+    it('accepts a valid ALLOWED_ORIGINS string', () => {
+      const result = validateEnv(validEnv());
+      expect(result.ALLOWED_ORIGINS).toBe('http://localhost:3001');
+    });
+
+    it('accepts multiple comma-separated origins', () => {
+      const result = validateEnv(
+        validEnv({
+          ALLOWED_ORIGINS:
+            'http://localhost:3001,https://app.devflow.com',
+        }),
+      );
+      expect(result.ALLOWED_ORIGINS).toContain('localhost');
+    });
+  });
+
+  // ── optional fields with defaults ──────────────────────────────────────────
+
+  describe('PORT', () => {
+    it('defaults to 3000 when PORT is not provided', () => {
+      const result = validateEnv(validEnv());
+      expect(result.PORT).toBe(3000);
+    });
+
+    it('parses PORT from string to number', () => {
+      const result = validateEnv(validEnv({ PORT: '4000' }));
+      expect(result.PORT).toBe(4000);
+    });
+
+    it('throws when PORT is zero (not positive)', () => {
+      expect(() => validateEnv(validEnv({ PORT: '0' }))).toThrow();
+    });
+
+    it('throws when PORT is not numeric', () => {
+      expect(() => validateEnv(validEnv({ PORT: 'abc' }))).toThrow();
+    });
+  });
+
+  describe('NODE_ENV', () => {
+    it('defaults to "development" when NODE_ENV is not provided', () => {
+      const result = validateEnv(validEnv());
+      expect(result.NODE_ENV).toBe('development');
+    });
+
+    it('accepts "production"', () => {
+      const result = validateEnv(validEnv({ NODE_ENV: 'production' }));
+      expect(result.NODE_ENV).toBe('production');
+    });
+
+    it('accepts "test"', () => {
+      const result = validateEnv(validEnv({ NODE_ENV: 'test' }));
+      expect(result.NODE_ENV).toBe('test');
+    });
+
     it('throws for an invalid NODE_ENV value', () => {
       expect(() => validateEnv(validEnv({ NODE_ENV: 'staging' }))).toThrow(
         /NODE_ENV/,
       );
     });
+  });
 
-    it('throws when NODE_ENV is missing', () => {
-      const env = validEnv();
-      delete env['NODE_ENV'];
-      expect(() => validateEnv(env)).toThrow(/NODE_ENV/);
+  describe('AGENT_PROVIDER', () => {
+    it('defaults to "mock" when AGENT_PROVIDER is not provided', () => {
+      const result = validateEnv(validEnv());
+      expect(result.AGENT_PROVIDER).toBe('mock');
     });
 
-    it('throws when NODE_ENV is an empty string', () => {
-      expect(() => validateEnv(validEnv({ NODE_ENV: '' }))).toThrow(/NODE_ENV/);
+    it('accepts "llm"', () => {
+      const result = validateEnv(validEnv({ AGENT_PROVIDER: 'llm' }));
+      expect(result.AGENT_PROVIDER).toBe('llm');
+    });
+
+    it('throws for an invalid AGENT_PROVIDER value', () => {
+      expect(() =>
+        validateEnv(validEnv({ AGENT_PROVIDER: 'openai' })),
+      ).toThrow(/AGENT_PROVIDER/);
     });
   });
 
-  describe('PORT validation', () => {
-    it('throws when PORT is missing', () => {
-      const env = validEnv();
-      delete env['PORT'];
-      expect(() => validateEnv(env)).toThrow(/PORT/);
+  describe('ENABLE_SWAGGER', () => {
+    it('defaults to "false" when not provided', () => {
+      const result = validateEnv(validEnv());
+      expect(result.ENABLE_SWAGGER).toBe('false');
     });
 
-    it('throws when PORT is zero', () => {
-      expect(() => validateEnv(validEnv({ PORT: '0' }))).toThrow(/PORT/);
-    });
-
-    it('throws when PORT is above 65535', () => {
-      expect(() => validateEnv(validEnv({ PORT: '65536' }))).toThrow(/PORT/);
-    });
-
-    it('throws when PORT is not a number', () => {
-      expect(() => validateEnv(validEnv({ PORT: 'abc' }))).toThrow(/PORT/);
-    });
-
-    it('accepts PORT at boundary value 1', () => {
-      const result = validateEnv(validEnv({ PORT: '1' }));
-      expect(result.PORT).toBe(1);
-    });
-
-    it('accepts PORT at boundary value 65535', () => {
-      const result = validateEnv(validEnv({ PORT: '65535' }));
-      expect(result.PORT).toBe(65535);
+    it('accepts "true"', () => {
+      const result = validateEnv(validEnv({ ENABLE_SWAGGER: 'true' }));
+      expect(result.ENABLE_SWAGGER).toBe('true');
     });
   });
 
-  describe('required string fields', () => {
-    const requiredFields = [
-      'SUPABASE_URL',
-      'SUPABASE_ANON_KEY',
-      'SUPABASE_SERVICE_ROLE_KEY',
-      'ALLOWED_ORIGINS',
-    ];
+  describe('SUPABASE_ANON_KEY and SUPABASE_SERVICE_ROLE_KEY', () => {
+    it('defaults SUPABASE_ANON_KEY to empty string', () => {
+      const result = validateEnv(validEnv());
+      expect(result.SUPABASE_ANON_KEY).toBe('');
+    });
 
-    for (const field of requiredFields) {
-      it(`throws when ${field} is missing`, () => {
-        const env = validEnv();
-        delete env[field];
-        expect(() => validateEnv(env)).toThrow(new RegExp(field));
-      });
+    it('defaults SUPABASE_SERVICE_ROLE_KEY to empty string', () => {
+      const result = validateEnv(validEnv());
+      expect(result.SUPABASE_SERVICE_ROLE_KEY).toBe('');
+    });
 
-      it(`throws when ${field} is an empty string`, () => {
-        expect(() => validateEnv(validEnv({ [field]: '' }))).toThrow(
-          new RegExp(field),
-        );
-      });
-
-      it(`throws when ${field} is whitespace only`, () => {
-        expect(() => validateEnv(validEnv({ [field]: '   ' }))).toThrow(
-          new RegExp(field),
-        );
-      });
-    }
+    it('accepts provided SUPABASE_ANON_KEY', () => {
+      const result = validateEnv(validEnv({ SUPABASE_ANON_KEY: 'anon-key-value' }));
+      expect(result.SUPABASE_ANON_KEY).toBe('anon-key-value');
+    });
   });
 
-  describe('optional field warnings', () => {
-    it('does not throw when API_CENTER_BASE_URL is missing', () => {
+  // ── optional agent/LLM fields ──────────────────────────────────────────────
+
+  describe('LLM configuration defaults', () => {
+    it('defaults LLM_PROVIDER to "openrouter"', () => {
+      const result = validateEnv(validEnv());
+      expect(result.LLM_PROVIDER).toBe('openrouter');
+    });
+
+    it('defaults LLM_REQUEST_TIMEOUT_MS to 120000', () => {
+      const result = validateEnv(validEnv());
+      expect(result.LLM_REQUEST_TIMEOUT_MS).toBe(120000);
+    });
+
+    it('defaults LLM_CONCURRENCY_LIMIT to 4', () => {
+      const result = validateEnv(validEnv());
+      expect(result.LLM_CONCURRENCY_LIMIT).toBe(4);
+    });
+  });
+
+  // ── happy path ─────────────────────────────────────────────────────────────
+
+  describe('happy path', () => {
+    it('returns a fully typed config for a minimal valid env', () => {
+      const result = validateEnv(validEnv());
+
+      expect(result.DATABASE_URL).toBe(
+        'postgresql://user:pass@localhost:5432/devflow_test',
+      );
+      expect(result.SUPABASE_URL).toBe('https://abc.supabase.co');
+      expect(result.ALLOWED_ORIGINS).toBe('http://localhost:3001');
+      expect(result.NODE_ENV).toBe('development');
+      expect(result.PORT).toBe(3000);
+      expect(result.AGENT_PROVIDER).toBe('mock');
+    });
+
+    it('does not throw for a minimal valid env', () => {
       expect(() => validateEnv(validEnv())).not.toThrow();
     });
 
-    it('does not throw when API_CENTER_API_KEY is missing', () => {
+    it('does not throw when optional fields are provided', () => {
       expect(() =>
         validateEnv(
-          validEnv({ API_CENTER_BASE_URL: 'http://api-center.local' }),
+          validEnv({
+            NODE_ENV: 'test',
+            PORT: '4000',
+            AGENT_PROVIDER: 'mock',
+            ENABLE_SWAGGER: 'false',
+            SUPABASE_ANON_KEY: 'anon-key',
+            SUPABASE_SERVICE_ROLE_KEY: 'service-key',
+          }),
         ),
       ).not.toThrow();
     });
 
-    it('does not throw when only APICENTER_URL alias is set', () => {
-      expect(() =>
-        validateEnv(validEnv({ APICENTER_URL: 'http://api-center.local' })),
-      ).not.toThrow();
+    it('accepts LLM_PROVIDER "anthropic"', () => {
+      const result = validateEnv(validEnv({ LLM_PROVIDER: 'anthropic' }));
+      expect(result.LLM_PROVIDER).toBe('anthropic');
     });
 
-    it('throws when API_CENTER_TIMEOUT_MS is invalid', () => {
-      expect(() =>
-        validateEnv(validEnv({ API_CENTER_TIMEOUT_MS: 'abc' })),
-      ).toThrow(/API_CENTER_TIMEOUT_MS/);
-    });
-
-    it('throws when API_CENTER_TIMEOUT_MS is zero', () => {
-      expect(() =>
-        validateEnv(validEnv({ API_CENTER_TIMEOUT_MS: '0' })),
-      ).toThrow(/API_CENTER_TIMEOUT_MS/);
+    it('parses LLM_REQUEST_TIMEOUT_MS from string', () => {
+      const result = validateEnv(
+        validEnv({ LLM_REQUEST_TIMEOUT_MS: '60000' }),
+      );
+      expect(result.LLM_REQUEST_TIMEOUT_MS).toBe(60000);
     });
   });
 
-  describe('production APICenter requirements', () => {
-    it('throws in production when API center base URL is missing', () => {
-      expect(() =>
-        validateEnv(
-          validEnv({
-            NODE_ENV: 'production',
-            API_CENTER_TRIBE_ID: 'tribe-a',
-            API_CENTER_TRIBE_SECRET: 'tribe-secret',
-          }),
-        ),
-      ).toThrow(/API_CENTER_BASE_URL|APICENTER_URL/);
+  // ── error message quality ──────────────────────────────────────────────────
+
+  describe('error message quality', () => {
+    it('includes the failing field name in the error message', () => {
+      const env = validEnv();
+      delete env['DATABASE_URL'];
+      let errorMessage = '';
+      try {
+        validateEnv(env);
+      } catch (e) {
+        errorMessage = (e as Error).message;
+      }
+      expect(errorMessage).toContain('DATABASE_URL');
     });
 
-    it('throws in production when auth variables are missing', () => {
-      expect(() =>
-        validateEnv(
-          validEnv({
-            NODE_ENV: 'production',
-            API_CENTER_BASE_URL: 'http://api-center.local',
-          }),
-        ),
-      ).toThrow(/Production APICenter auth is missing/);
-    });
-
-    it('passes in production with tribe credentials', () => {
-      expect(() =>
-        validateEnv(
-          validEnv({
-            NODE_ENV: 'production',
-            API_CENTER_BASE_URL: 'http://api-center.local',
-            API_CENTER_TRIBE_ID: 'tribe-a',
-            API_CENTER_TRIBE_SECRET: 'tribe-secret',
-          }),
-        ),
-      ).not.toThrow();
+    it('throws an Error instance (not a plain string)', () => {
+      const env = validEnv();
+      delete env['DATABASE_URL'];
+      expect(() => validateEnv(env)).toThrow(Error);
     });
   });
 });
