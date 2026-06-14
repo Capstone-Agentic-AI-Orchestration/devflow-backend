@@ -71,13 +71,10 @@ export class RunSupervisorService {
    */
   @Interval(POLL_INTERVAL_MS)
   async supervisorTick(): Promise<void> {
-    this.logger.debug('Supervisor tick — scanning for stuck runs');
-
     try {
       const stuckProjects = await this.findStuckProjects();
 
       if (stuckProjects.length === 0) {
-        this.logger.debug('No stuck runs found');
         return;
       }
 

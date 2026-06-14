@@ -1,4 +1,4 @@
-import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import {
   AdminDomainStatus,
   Prisma,
@@ -9,12 +9,18 @@ import {
   WorkOrderStatus,
 } from '@prisma/client';
 import { AuthUser } from '../auth/auth.types';
+import { GithubService } from '../github/github.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { CreateAdminDomainDto, HandoffOverrideDto, UpdateAdminDomainDto } from './dto/admin.dto';
 
 @Injectable()
 export class AdminService {
-  constructor(private readonly prisma: PrismaService) {}
+  private readonly logger = new Logger(AdminService.name);
+
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly githubService: GithubService,
+  ) {}
 
   async listUsers(input: { q?: string; role?: UserRole }) {
     const query = input.q?.trim();
@@ -364,6 +370,47 @@ export class AdminService {
     });
     this.audit(actor, 'admin.setting.updated', 'setting', key, `Updated platform setting ${key}`, { value: jsonValue } as Prisma.InputJsonValue).catch(() => {});
     return setting;
+  }
+
+  async createRepository(projectId: string, actor: AuthUser) {
+    const project = await this.prisma.project.findUnique({
+      where: { id: projectId },
+      select: { id: true, companyName: true, repoUrl: true },
+    });
+    if (!project) throw new NotFoundException(`Project ${projectId} not found`);
+    if (project.repoUrl) {
+      throw new BadRequestException(
+        `Project ${projectId} already has a repository: ${project.repoUrl}`,
+      );
+    }
+
+    const repoName = this.githubService.buildRepoName(
+      project.companyName,
+      project.id,
+    );
+    const cloneUrl = await this.githubService.createRepo(repoName);
+
+    await this.githubService.injectCiWorkflow(repoName).catch((err) => {
+      this.logger.warn(
+        `[${projectId}] CI workflow injection failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+      );
+    });
+
+    await this.prisma.project.update({
+      where: { id: projectId },
+      data: { repoUrl: cloneUrl },
+    });
+
+    this.audit(
+      actor,
+      'admin.repository.created',
+      'project',
+      projectId,
+      `Created GitHub repository for ${project.companyName}`,
+      { repoUrl: cloneUrl },
+    ).catch(() => {});
+
+    return { repoUrl: cloneUrl };
   }
 
   private async findProfile(id: string) {

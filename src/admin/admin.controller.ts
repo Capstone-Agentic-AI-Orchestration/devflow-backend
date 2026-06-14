@@ -92,6 +92,11 @@ export class AdminController {
     return this.adminService.listRepositories();
   }
 
+  @Post('projects/:id/repository/create')
+  createRepository(@Param('id') id: string, @CurrentUser() user: AuthUser) {
+    return this.adminService.createRepository(id, user);
+  }
+
   @Patch('projects/:id/repository')
   linkRepository(
     @Param('id') id: string,
