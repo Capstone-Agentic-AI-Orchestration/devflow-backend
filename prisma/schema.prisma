@@ -303,10 +303,12 @@ model Profile {
   acceptedDeliveries ProjectDeliveryReview[] @relation("DeliveryAcceptor")
   requestedDeliveryRevisions ProjectDeliveryReview[] @relation("DeliveryRevisionRequester")
   resolvedDeliveryRevisions ProjectDeliveryReview[] @relation("DeliveryRevisionResolver")
-  adminAuditLogs   AdminAuditLog[] @relation("AdminAuditActor")
-  scheduleEvents   ScheduleEvent[] @relation("ScheduleOwner")
+  scheduleEvents ScheduleEvent[] @relation("ScheduleOwner")
   developerProfile DeveloperProfile?
+  adminAuditLogs AdminAuditLog[] @relation("AdminAuditActor")
 
+  @@index([role])
+  @@index([status])
   @@map("profiles")
 }
 
@@ -356,6 +358,7 @@ model ProjectMember {
 
   @@unique([projectId, userId])
   @@index([userId])
+  @@index([projectId, role])
   @@map("project_members")
 }
 

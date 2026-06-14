@@ -54,6 +54,12 @@ export class ProjectsController {
     return this.projectsService.findAll(user);
   }
 
+  @Get('details')
+  @Roles(UserRole.ADMIN)
+  findAllDetails(@CurrentUser() user: AuthUser) {
+    return this.projectsService.findAllDetails(user);
+  }
+
   @Get(':id')
   @Roles(UserRole.CLIENT, UserRole.PM, UserRole.DEV, UserRole.ADMIN)
   findOne(@Param('id') id: string, @CurrentUser() user: AuthUser) {

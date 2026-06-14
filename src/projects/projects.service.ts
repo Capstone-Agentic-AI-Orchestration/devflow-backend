@@ -578,6 +578,96 @@ export class ProjectsService {
     }));
   }
 
+  async findAllDetails(user: AuthUser): Promise<ProjectWithRelations[]> {
+    const projects = await this.prisma.project.findMany({
+      where: this.projectAccessWhere(user),
+      include: {
+        createdBy: {
+          select: {
+            id: true,
+            email: true,
+            fullName: true,
+            role: true,
+          },
+        },
+        members: {
+          orderBy: { createdAt: 'asc' },
+          include: {
+            user: {
+              select: {
+                id: true,
+                email: true,
+                fullName: true,
+                role: true,
+              },
+            },
+          },
+        },
+        gates: {
+          orderBy: { decidedAt: 'desc' },
+        },
+        runBudget: {
+          select: {
+            id: true,
+            tokenBudget: true,
+            tokensConsumed: true,
+            retryCount: true,
+            maxRetries: true,
+            createdAt: true,
+            updatedAt: true,
+          },
+        },
+        kickoff: true,
+        deliveryReview: true,
+        artifacts: {
+          select: {
+            clientVisible: true,
+            reviewStatus: true,
+            revisionHandledAt: true,
+          },
+        },
+        tasks: {
+          select: { status: true },
+        },
+        workOrders: {
+          select: { status: true },
+        },
+        clientInvites: {
+          orderBy: { createdAt: 'asc' },
+          select: {
+            id: true,
+            email: true,
+            contactName: true,
+            companyName: true,
+            status: true,
+            acceptedById: true,
+            acceptedAt: true,
+            createdAt: true,
+            updatedAt: true,
+          },
+        },
+        _count: {
+          select: { artifacts: true, eventLogs: true },
+        },
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+
+    return projects.map((project) => {
+      const {
+        artifacts: _lifecycleArtifacts,
+        tasks: _lifecycleTasks,
+        workOrders: _lifecycleWorkOrders,
+        ...projectDetail
+      } = project;
+
+      return {
+        ...projectDetail,
+        lifecycle: this.deriveProjectLifecycle(project),
+      };
+    });
+  }
+
   async findOne(id: string, user: AuthUser): Promise<ProjectWithRelations> {
     const project = await this.prisma.project.findFirst({
       where: this.projectAccessWhere(user, id),

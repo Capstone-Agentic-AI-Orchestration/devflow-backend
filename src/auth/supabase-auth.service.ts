@@ -1,14 +1,18 @@
-import { Injectable, UnauthorizedException } from '@nestjs/common';
+import { Injectable, OnModuleInit, UnauthorizedException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { createRemoteJWKSet, jwtVerify, JWTPayload } from 'jose';
 import { ClientInviteStatus, ProfileStatus, UserRole } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { AuthUser } from './auth.types';
 
+const INVITE_CHECK_INTERVAL_MS = 5 * 60 * 1000;
+
 @Injectable()
-export class SupabaseAuthService {
+export class SupabaseAuthService implements OnModuleInit {
   private readonly issuer: string;
   private readonly jwks: ReturnType<typeof createRemoteJWKSet>;
+  private jwksWarmed = false;
+  private readonly lastInviteCheck = new Map<string, number>();
 
   constructor(
     private readonly configService: ConfigService,
@@ -26,8 +30,27 @@ export class SupabaseAuthService {
     );
   }
 
+  async onModuleInit() {
+    await this.warmJwks();
+  }
+
+  private async warmJwks() {
+    try {
+      const fakeToken =
+        'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ3YXJtdXAiLCJpYXQiOjAsImV4cCI6OTQ2Njg0ODAwfQ';
+      await jwtVerify(fakeToken, this.jwks).catch(() => {});
+      this.jwksWarmed = true;
+    } catch {
+      // JWKS warming is best-effort
+    }
+  }
+
   async verifyAccessToken(token: string): Promise<AuthUser> {
     try {
+      if (!this.jwksWarmed) {
+        await this.warmJwks();
+      }
+
       const { payload } = await jwtVerify(token, this.jwks, {
         issuer: this.issuer,
         audience: 'authenticated',
@@ -47,32 +70,45 @@ export class SupabaseAuthService {
 
     const email = this.getEmail(payload);
     const fullName = this.getFullName(payload);
-    const profile = await this.prisma.profile.upsert({
+
+    const existing = await this.prisma.profile.findUnique({
       where: { id: userId },
-      update: {
-        email,
-        ...(fullName ? { fullName } : {}),
-      },
-      create: {
-        id: userId,
-        email,
-        fullName,
-        role: UserRole.CLIENT,
-      },
-      select: {
-        id: true,
-        email: true,
-        fullName: true,
-        role: true,
-        status: true,
-      },
+      select: { id: true, email: true, fullName: true, role: true, status: true },
     });
+
+    let profile: { id: string; email: string | null; fullName: string | null; role: UserRole; status: ProfileStatus };
+
+    if (existing) {
+      if (existing.email !== email || (fullName && existing.fullName !== fullName)) {
+        profile = await this.prisma.profile.update({
+          where: { id: userId },
+          data: { email, ...(fullName ? { fullName } : {}) },
+          select: { id: true, email: true, fullName: true, role: true, status: true },
+        });
+      } else {
+        profile = existing;
+      }
+    } else {
+      profile = await this.prisma.profile.create({
+        data: {
+          id: userId,
+          email,
+          fullName,
+          role: UserRole.CLIENT,
+        },
+        select: { id: true, email: true, fullName: true, role: true, status: true },
+      });
+    }
 
     if (profile.status === ProfileStatus.SUSPENDED) {
       throw new UnauthorizedException('This account has been suspended');
     }
 
-    await this.acceptPendingClientInvites(profile);
+    const lastCheck = this.lastInviteCheck.get(userId) ?? 0;
+    if (Date.now() - lastCheck > INVITE_CHECK_INTERVAL_MS) {
+      await this.acceptPendingClientInvites(profile);
+      this.lastInviteCheck.set(userId, Date.now());
+    }
 
     return profile;
   }

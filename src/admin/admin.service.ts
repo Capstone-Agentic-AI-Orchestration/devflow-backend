@@ -62,15 +62,27 @@ export class AdminService {
     const updated = await this.prisma.profile.update({
       where: { id },
       data: { role },
-      select: this.profileSelect(),
+      select: {
+        id: true, email: true, fullName: true, role: true, status: true,
+        createdAt: true, updatedAt: true,
+        memberships: { select: { projectId: true, role: true } },
+        createdProjects: { select: { id: true } },
+      },
     });
+    const result = {
+      ...updated,
+      projectCount: new Set([
+        ...updated.memberships.map((member) => member.projectId),
+        ...updated.createdProjects.map((project) => project.id),
+      ]).size,
+    };
 
-    await this.audit(actor, 'admin.user.role_updated', 'profile', id, `Changed ${updated.email ?? id} role to ${role}`, {
+    this.audit(actor, 'admin.user.role_updated', 'profile', id, `Changed ${updated.email ?? id} role to ${role}`, {
       previousRole: previous.role,
       nextRole: role,
-    });
+    }).catch(() => {});
 
-    return updated;
+    return result;
   }
 
   async updateUserStatus(id: string, status: ProfileStatus, actor: AuthUser) {
@@ -82,15 +94,27 @@ export class AdminService {
     const updated = await this.prisma.profile.update({
       where: { id },
       data: { status },
-      select: this.profileSelect(),
+      select: {
+        id: true, email: true, fullName: true, role: true, status: true,
+        createdAt: true, updatedAt: true,
+        memberships: { select: { projectId: true, role: true } },
+        createdProjects: { select: { id: true } },
+      },
     });
+    const result = {
+      ...updated,
+      projectCount: new Set([
+        ...updated.memberships.map((member) => member.projectId),
+        ...updated.createdProjects.map((project) => project.id),
+      ]).size,
+    };
 
-    await this.audit(actor, 'admin.user.status_updated', 'profile', id, `Changed ${updated.email ?? id} status to ${status}`, {
+    this.audit(actor, 'admin.user.status_updated', 'profile', id, `Changed ${updated.email ?? id} status to ${status}`, {
       previousStatus: previous.status,
       nextStatus: status,
-    });
+    }).catch(() => {});
 
-    return updated;
+    return result;
   }
 
   listDomains() {
@@ -108,7 +132,7 @@ export class AdminService {
         createdById: actor.id,
       },
     });
-    await this.audit(actor, 'admin.domain.created', 'domain', domain.id, `Created domain ${domain.name}`, domain);
+    this.audit(actor, 'admin.domain.created', 'domain', domain.id, `Created domain ${domain.name}`, domain).catch(() => {});
     return domain;
   }
 
@@ -125,10 +149,10 @@ export class AdminService {
         verifiedAt: dto.status === AdminDomainStatus.VERIFIED ? new Date() : undefined,
       },
     });
-    await this.audit(actor, 'admin.domain.updated', 'domain', id, `Updated domain ${domain.name}`, {
+    this.audit(actor, 'admin.domain.updated', 'domain', id, `Updated domain ${domain.name}`, {
       previousStatus: existing.status,
       nextStatus: domain.status,
-    });
+    }).catch(() => {});
     return domain;
   }
 
@@ -138,16 +162,16 @@ export class AdminService {
       where: { id },
       data: { status: AdminDomainStatus.VERIFIED, verifiedAt: new Date() },
     });
-    await this.audit(actor, 'admin.domain.verified', 'domain', id, `Verified domain ${existing.name}`, {
+    this.audit(actor, 'admin.domain.verified', 'domain', id, `Verified domain ${existing.name}`, {
       previousStatus: existing.status,
-    });
+    }).catch(() => {});
     return domain;
   }
 
   async deleteDomain(id: string, actor: AuthUser) {
     const existing = await this.findDomain(id);
     await this.prisma.adminDomain.delete({ where: { id } });
-    await this.audit(actor, 'admin.domain.deleted', 'domain', id, `Deleted domain ${existing.name}`, existing);
+    this.audit(actor, 'admin.domain.deleted', 'domain', id, `Deleted domain ${existing.name}`, existing).catch(() => {});
     return { deleted: true };
   }
 
@@ -179,14 +203,22 @@ export class AdminService {
     const project = await this.prisma.project.update({
       where: { id: projectId },
       data: { repoUrl },
-      select: { id: true, companyName: true, repoUrl: true, status: true, updatedAt: true },
+      select: { id: true, companyName: true, repoUrl: true, status: true, updatedAt: true, runId: true },
     }).catch(() => null);
     if (!project) throw new NotFoundException(`Project ${projectId} not found`);
 
-    await this.audit(actor, 'admin.repository.linked', 'project', projectId, `Linked GitHub repository for ${project.companyName}`, {
+    this.audit(actor, 'admin.repository.linked', 'project', projectId, `Linked GitHub repository for ${project.companyName}`, {
       repoUrl,
-    });
-    return project;
+    }).catch(() => {});
+    return {
+      projectId: project.id,
+      companyName: project.companyName,
+      status: project.status,
+      repoUrl: project.repoUrl,
+      runId: project.runId,
+      linked: Boolean(project.repoUrl),
+      updatedAt: project.updatedAt,
+    };
   }
 
   async listHandoffs() {
@@ -231,7 +263,7 @@ export class AdminService {
     const updated = await this.prisma.project.update({
       where: { id: projectId },
       data: { status: dto.markReady ? ProjectStatus.AWAITING_GATE_2 : undefined },
-      select: { id: true, companyName: true, status: true, updatedAt: true },
+      select: { id: true, companyName: true, status: true, createdAt: true, updatedAt: true },
     });
 
     await Promise.all([
@@ -330,7 +362,7 @@ export class AdminService {
       update: { value: jsonValue, updatedById: actor.id },
       create: { key, value: jsonValue, updatedById: actor.id },
     });
-    await this.audit(actor, 'admin.setting.updated', 'setting', key, `Updated platform setting ${key}`, { value: jsonValue } as Prisma.InputJsonValue);
+    this.audit(actor, 'admin.setting.updated', 'setting', key, `Updated platform setting ${key}`, { value: jsonValue } as Prisma.InputJsonValue).catch(() => {});
     return setting;
   }
 

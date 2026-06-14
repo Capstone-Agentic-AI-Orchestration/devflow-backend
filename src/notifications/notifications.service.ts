@@ -18,9 +18,40 @@ const notificationInclude = {
   },
 } satisfies Prisma.NotificationInclude;
 
+interface CacheEntry<T> {
+  data: T;
+  expiry: number;
+}
+
+const CACHE_TTL_MS = 10_000;
+
 @Injectable()
 export class NotificationsService {
+  private readonly projectManagersCache = new Map<string, CacheEntry<string[]>>();
+  private readonly projectClientsCache = new Map<string, CacheEntry<string[]>>();
+
   constructor(private readonly prisma: PrismaService) {}
+
+  private cached<T>(cache: Map<string, CacheEntry<T>>, key: string, fetcher: () => Promise<T>): Promise<T> {
+    const entry = cache.get(key);
+    if (entry && Date.now() < entry.expiry) {
+      return Promise.resolve(entry.data);
+    }
+    return fetcher().then((data) => {
+      cache.set(key, { data, expiry: Date.now() + CACHE_TTL_MS });
+      return data;
+    });
+  }
+
+  invalidateProjectCache(projectId?: string) {
+    if (projectId) {
+      this.projectManagersCache.delete(projectId);
+      this.projectClientsCache.delete(projectId);
+    } else {
+      this.projectManagersCache.clear();
+      this.projectClientsCache.clear();
+    }
+  }
 
   list(user: AuthUser): Promise<NotificationWithActor[]> {
     return this.prisma.notification.findMany({
@@ -109,47 +140,53 @@ export class NotificationsService {
   }
 
   async projectManagers(projectId?: string): Promise<string[]> {
-    if (projectId) {
-      const [project, adminProfiles] = await Promise.all([
-        this.prisma.project.findUnique({
-          where: { id: projectId },
-          select: {
-            createdById: true,
-            members: {
-              where: { role: { in: [UserRole.PM, UserRole.ADMIN] } },
-              select: { userId: true },
+    const cacheKey = projectId ?? '__global';
+
+    return this.cached(this.projectManagersCache, cacheKey, async () => {
+      if (projectId) {
+        const [project, adminProfiles] = await Promise.all([
+          this.prisma.project.findUnique({
+            where: { id: projectId },
+            select: {
+              createdById: true,
+              members: {
+                where: { role: { in: [UserRole.PM, UserRole.ADMIN] } },
+                select: { userId: true },
+              },
             },
-          },
-        }),
-        this.prisma.profile.findMany({
-          where: { role: UserRole.ADMIN },
-          select: { id: true },
-        }),
-      ]);
+          }),
+          this.prisma.profile.findMany({
+            where: { role: UserRole.ADMIN },
+            select: { id: true },
+          }),
+        ]);
 
-      return [
-        ...new Set([
-          project?.createdById,
-          ...(project?.members.map((member) => member.userId) ?? []),
-          ...adminProfiles.map((profile) => profile.id),
-        ].filter(Boolean) as string[]),
-      ];
-    }
+        return [
+          ...new Set([
+            project?.createdById,
+            ...(project?.members.map((member) => member.userId) ?? []),
+            ...adminProfiles.map((profile) => profile.id),
+          ].filter(Boolean) as string[]),
+        ];
+      }
 
-    const profiles = await this.prisma.profile.findMany({
-      where: { role: { in: [UserRole.PM, UserRole.ADMIN] } },
-      select: { id: true },
+      const profiles = await this.prisma.profile.findMany({
+        where: { role: { in: [UserRole.PM, UserRole.ADMIN] } },
+        select: { id: true },
+      });
+
+      return profiles.map((profile) => profile.id);
     });
-
-    return profiles.map((profile) => profile.id);
   }
 
   async projectClients(projectId: string): Promise<string[]> {
-    const members = await this.prisma.projectMember.findMany({
-      where: { projectId, role: UserRole.CLIENT },
-      select: { userId: true },
-    });
+    return this.cached(this.projectClientsCache, projectId, async () => {
+      const members = await this.prisma.projectMember.findMany({
+        where: { projectId, role: UserRole.CLIENT },
+        select: { userId: true },
+      });
 
-    return members.map((member) => member.userId);
+      return members.map((member) => member.userId);
+    });
   }
 }

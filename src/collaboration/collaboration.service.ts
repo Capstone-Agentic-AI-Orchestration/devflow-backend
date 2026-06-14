@@ -89,12 +89,28 @@ export class CollaborationService {
       orderBy: [{ lastMessageAt: 'desc' }, { createdAt: 'desc' }],
     });
 
-    return Promise.all(
-      conversations.map(async (conversation) => ({
+    const conversationIds = conversations.map((c) => c.id);
+    const unreadCounts = conversationIds.length
+      ? await this.prisma.projectMessage.groupBy({
+          by: ['conversationId'],
+          where: {
+            conversationId: { in: conversationIds },
+            authorId: { not: user.id },
+          },
+          _count: { conversationId: true },
+        })
+      : [];
+
+    const unreadMap = new Map(unreadCounts.map((u) => [u.conversationId, u._count.conversationId]));
+
+    return conversations.map((conversation) => {
+      const lastReadAt = conversation.reads[0]?.lastReadAt;
+      const totalUnread = unreadMap.get(conversation.id) ?? 0;
+      return {
         ...conversation,
-        unreadCount: await this.unreadCount(conversation.id, user.id, conversation.reads[0]?.lastReadAt),
-      })),
-    );
+        unreadCount: lastReadAt ? Math.max(0, totalUnread) : totalUnread,
+      };
+    });
   }
 
   async createConversation(
