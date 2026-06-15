@@ -2,7 +2,7 @@ name: "BE Pipeline Caller"
 
 on:
   push:
-    branches: [test, uat, main]
+    branches: [develop, test, uat, main]
   workflow_dispatch:
     inputs:
       pipeline_mode:

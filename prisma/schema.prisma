@@ -1,12 +1,14 @@
 generator client {
   provider        = "prisma-client-js"
-  previewFeatures = ["postgresqlExtensions"]
+  previewFeatures = ["multiSchema", "postgresqlExtensions"]
 }
 
 datasource db {
-  provider   = "postgresql"
-  url        = env("DATABASE_URL")
-  extensions = [pgvector(map: "vector")]
+  provider      = "postgresql"
+  url           = env("DATABASE_URL")
+  schemas       = ["admin", "collaboration", "identity", "intake", "integration", "memory", "notifications", "orchestration", "projects", "scheduling"]
+  extensions    = [pgvector(map: "vector")]
+  relationMode  = "prisma"
 }
 
 model Project {
@@ -19,6 +21,7 @@ model Project {
   repoUrl     String?
   createdById String?         @db.Uuid
   createdBy   Profile?        @relation("ProjectCreatedBy", fields: [createdById], references: [id])
+  version     Int             @default(1)
   createdAt   DateTime        @default(now())
   updatedAt   DateTime        @updatedAt
   gates       GateEvent[]
@@ -36,14 +39,19 @@ model Project {
   deliveryReview ProjectDeliveryReview?
   orchestrationRuns OrchestrationRun[]
   workOrderExecutions WorkOrderExecution[]
+  scheduleEvents ScheduleEvent[]
 
   @@index([createdById])
+  @@index([id, version])
+  @@schema("projects")
 }
 
 enum InquiryStatus {
   NEW
   APPROVED
   REJECTED
+
+  @@schema("intake")
 }
 
 model ClientInquiry {
@@ -71,18 +79,23 @@ model ClientInquiry {
   @@index([email])
   @@index([reviewedById])
   @@map("client_inquiries")
+  @@schema("intake")
 }
 
 enum ClientInviteStatus {
   PENDING
   ACCEPTED
   REVOKED
+
+  @@schema("intake")
 }
 
 enum ProjectKickoffStatus {
   DRAFT
   READY
   LOCKED
+
+  @@schema("projects")
 }
 
 model ClientInvite {
@@ -107,6 +120,7 @@ model ClientInvite {
   @@index([createdById])
   @@index([acceptedById])
   @@map("client_invites")
+  @@schema("intake")
 }
 
 model ProjectKickoff {
@@ -140,6 +154,7 @@ model ProjectKickoff {
   @@index([completedById])
   @@index([updatedById])
   @@map("project_kickoffs")
+  @@schema("projects")
 }
 
 model GateEvent {
@@ -152,6 +167,7 @@ model GateEvent {
   decidedAt DateTime     @default(now())
 
   @@index([projectId])
+  @@schema("projects")
 }
 
 model Artifact {
@@ -189,12 +205,15 @@ model Artifact {
   @@index([projectId, clientVisible])
   @@index([projectId, outputReviewStatus])
   @@index([projectId, validationStatus])
+  @@schema("projects")
 }
 
 enum ArtifactReviewStatus {
   PENDING
   APPROVED
   REVISION_REQUESTED
+
+  @@schema("projects")
 }
 
 enum ArtifactOutputReviewStatus {
@@ -202,12 +221,16 @@ enum ArtifactOutputReviewStatus {
   APPROVED
   REWORK_REQUESTED
   PUBLISHED
+
+  @@schema("projects")
 }
 
 enum ArtifactValidationStatus {
   PENDING
   PASSED
   FAILED
+
+  @@schema("projects")
 }
 
 enum ProjectStatus {
@@ -220,16 +243,22 @@ enum ProjectStatus {
   COMMITTING
   DELIVERED
   FAILED
+
+  @@schema("projects")
 }
 
 enum GateType {
   ARCHITECTURE_REVIEW
   CODE_REVIEW
+
+  @@schema("projects")
 }
 
 enum GateDecision {
   APPROVED
   REJECTED
+
+  @@schema("projects")
 }
 
 enum UserRole {
@@ -237,6 +266,41 @@ enum UserRole {
   PM
   DEV
   ADMIN
+
+  @@schema("identity")
+}
+
+enum ProfileStatus {
+  ACTIVE
+  SUSPENDED
+
+  @@schema("identity")
+}
+
+enum ScheduleEventType {
+  MILESTONE
+  MEETING
+  DUE_DATE
+  REMINDER
+  OTHER
+
+  @@schema("scheduling")
+}
+
+enum ScheduleVisibility {
+  PRIVATE
+  TEAM
+  CLIENT
+
+  @@schema("scheduling")
+}
+
+enum DeveloperAvailabilityStatus {
+  AVAILABLE
+  LIMITED
+  UNAVAILABLE
+
+  @@schema("identity")
 }
 
 enum ProjectTaskStatus {
@@ -244,6 +308,8 @@ enum ProjectTaskStatus {
   IN_PROGRESS
   IN_REVIEW
   DONE
+
+  @@schema("projects")
 }
 
 model Profile {
@@ -251,6 +317,8 @@ model Profile {
   email           String?         @unique
   fullName        String?
   role            UserRole        @default(CLIENT)
+  status          ProfileStatus   @default(ACTIVE)
+  preferences     Json            @default("{}")
   createdAt       DateTime        @default(now())
   updatedAt       DateTime        @updatedAt
   createdProjects Project[]       @relation("ProjectCreatedBy")
@@ -275,8 +343,51 @@ model Profile {
   acceptedDeliveries ProjectDeliveryReview[] @relation("DeliveryAcceptor")
   requestedDeliveryRevisions ProjectDeliveryReview[] @relation("DeliveryRevisionRequester")
   resolvedDeliveryRevisions ProjectDeliveryReview[] @relation("DeliveryRevisionResolver")
+  scheduleEvents ScheduleEvent[] @relation("ScheduleOwner")
+  developerProfile DeveloperProfile?
+  adminAuditLogs AdminAuditLog[] @relation("AdminAuditActor")
 
+  @@index([role])
+  @@index([status])
   @@map("profiles")
+  @@schema("identity")
+}
+
+model ScheduleEvent {
+  id          String             @id @default(cuid())
+  title       String
+  description String?            @db.Text
+  startsAt    DateTime
+  endsAt      DateTime?
+  type        ScheduleEventType  @default(MEETING)
+  visibility  ScheduleVisibility @default(TEAM)
+  projectId   String?
+  project     Project?           @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  ownerId     String             @db.Uuid
+  owner       Profile            @relation("ScheduleOwner", fields: [ownerId], references: [id], onDelete: Cascade)
+  createdAt   DateTime           @default(now())
+  updatedAt   DateTime           @updatedAt
+
+  @@index([ownerId, startsAt])
+  @@index([projectId, startsAt])
+  @@index([visibility, startsAt])
+  @@map("schedule_events")
+  @@schema("scheduling")
+}
+
+model DeveloperProfile {
+  userId              String                      @id @db.Uuid
+  user                Profile                     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  skills              Json                        @default("[]")
+  weeklyCapacityHours Int                         @default(40)
+  availabilityStatus  DeveloperAvailabilityStatus @default(AVAILABLE)
+  notes               String?                     @db.Text
+  createdAt           DateTime                    @default(now())
+  updatedAt           DateTime                    @updatedAt
+
+  @@index([availabilityStatus])
+  @@map("developer_profiles")
+  @@schema("identity")
 }
 
 model ProjectMember {
@@ -290,7 +401,9 @@ model ProjectMember {
 
   @@unique([projectId, userId])
   @@index([userId])
+  @@index([projectId, role])
   @@map("project_members")
+  @@schema("projects")
 }
 
 model ProjectTask {
@@ -306,6 +419,7 @@ model ProjectTask {
   assignedTo   Profile?          @relation("TaskAssignee", fields: [assignedToId], references: [id], onDelete: SetNull)
   createdById  String?           @db.Uuid
   createdBy    Profile?          @relation("TaskCreator", fields: [createdById], references: [id], onDelete: SetNull)
+  version      Int               @default(1)
   createdAt    DateTime          @default(now())
   updatedAt    DateTime          @updatedAt
   activities   ProjectTaskActivity[]
@@ -314,7 +428,9 @@ model ProjectTask {
   @@index([projectId, status])
   @@index([assignedToId, status])
   @@index([artifactId])
+  @@index([id, version])
   @@map("project_tasks")
+  @@schema("projects")
 }
 
 enum ProjectTaskActivityType {
@@ -323,6 +439,8 @@ enum ProjectTaskActivityType {
   ASSIGNEE_CHANGED
   ARTIFACT_CHANGED
   COMMENT
+
+  @@schema("projects")
 }
 
 model ProjectTaskActivity {
@@ -340,6 +458,7 @@ model ProjectTaskActivity {
   @@index([projectId, taskId, createdAt])
   @@index([actorId])
   @@map("project_task_activities")
+  @@schema("projects")
 }
 
 enum NotificationType {
@@ -363,6 +482,8 @@ enum NotificationType {
   COLLAB_MESSAGE_SENT
   COLLAB_DOCUMENT_UPLOADED
   COLLAB_DOCUMENT_REVIEWED
+
+  @@schema("notifications")
 }
 
 enum ProjectTimelineEventType {
@@ -393,6 +514,8 @@ enum ProjectTimelineEventType {
   COLLAB_MESSAGE_SENT
   COLLAB_DOCUMENT_UPLOADED
   COLLAB_DOCUMENT_REVIEWED
+
+  @@schema("projects")
 }
 
 enum ProjectDeliveryReviewStatus {
@@ -400,6 +523,8 @@ enum ProjectDeliveryReviewStatus {
   ACCEPTED
   REVISION_REQUESTED
   REVISION_RESOLVED
+
+  @@schema("projects")
 }
 
 model ProjectDeliveryReview {
@@ -419,19 +544,24 @@ model ProjectDeliveryReview {
   revisionResolvedBy    Profile?                    @relation("DeliveryRevisionResolver", fields: [revisionResolvedById], references: [id], onDelete: SetNull)
   revisionResolvedAt    DateTime?
   resolutionNote        String?                     @db.Text
+  version               Int                         @default(1)
   createdAt             DateTime                    @default(now())
   updatedAt             DateTime                    @updatedAt
 
+  @@index([projectId, version])
   @@index([status])
   @@index([acceptedById])
   @@index([revisionRequestedById])
   @@index([revisionResolvedById])
   @@map("project_delivery_reviews")
+  @@schema("projects")
 }
 
 enum CollaborationVisibility {
   TEAM
   CLIENT
+
+  @@schema("collaboration")
 }
 
 enum ConversationCategory {
@@ -439,6 +569,8 @@ enum ConversationCategory {
   DELIVERY
   CONTRACT
   SUPPORT
+
+  @@schema("collaboration")
 }
 
 model ProjectConversation {
@@ -459,6 +591,7 @@ model ProjectConversation {
   @@index([projectId, visibility, lastMessageAt])
   @@index([createdById])
   @@map("project_conversations")
+  @@schema("collaboration")
 }
 
 model ProjectMessage {
@@ -475,6 +608,7 @@ model ProjectMessage {
   @@index([conversationId, createdAt])
   @@index([authorId])
   @@map("project_messages")
+  @@schema("collaboration")
 }
 
 model ConversationRead {
@@ -488,6 +622,7 @@ model ConversationRead {
   @@unique([conversationId, userId])
   @@index([userId])
   @@map("conversation_reads")
+  @@schema("collaboration")
 }
 
 enum CollaborationDocumentKind {
@@ -495,6 +630,8 @@ enum CollaborationDocumentKind {
   CONTRACT
   DELIVERABLE
   GENERAL
+
+  @@schema("collaboration")
 }
 
 enum CollaborationDocumentStatus {
@@ -504,6 +641,8 @@ enum CollaborationDocumentStatus {
   APPROVED
   REVISION_REQUESTED
   ARCHIVED
+
+  @@schema("collaboration")
 }
 
 model CollaborationDocument {
@@ -524,13 +663,16 @@ model CollaborationDocument {
   reviewedBy     Profile?                    @relation("DocumentReviewer", fields: [reviewedById], references: [id], onDelete: SetNull)
   reviewNote     String?                     @db.Text
   reviewedAt     DateTime?
+  version        Int                         @default(1)
   createdAt      DateTime                    @default(now())
   updatedAt      DateTime                    @updatedAt
 
   @@index([projectId, clientVisible, status])
+  @@index([id, version])
   @@index([uploadedById])
   @@index([reviewedById])
   @@map("collaboration_documents")
+  @@schema("collaboration")
 }
 
 enum WorkOrderAgentType {
@@ -539,6 +681,8 @@ enum WorkOrderAgentType {
   DATABASE
   ARCHITECTURE
   CONTRACT
+
+  @@schema("orchestration")
 }
 
 enum WorkOrderStatus {
@@ -548,6 +692,8 @@ enum WorkOrderStatus {
   COMPLETED
   FAILED
   CANCELLED
+
+  @@schema("orchestration")
 }
 
 enum WorkOrderPriority {
@@ -555,6 +701,8 @@ enum WorkOrderPriority {
   NORMAL
   HIGH
   URGENT
+
+  @@schema("orchestration")
 }
 
 enum OrchestrationRunStatus {
@@ -562,6 +710,8 @@ enum OrchestrationRunStatus {
   SUCCEEDED
   FAILED
   CANCELLED
+
+  @@schema("orchestration")
 }
 
 enum OrchestrationRunTrigger {
@@ -569,12 +719,16 @@ enum OrchestrationRunTrigger {
   RERUN_READY_WORK_ORDERS
   WORK_ORDER_DISPATCH
   RETRY_FAILED_WORK_ORDER
+
+  @@schema("orchestration")
 }
 
 enum WorkOrderExecutionStatus {
   RUNNING
   SUCCEEDED
   FAILED
+
+  @@schema("orchestration")
 }
 
 model WorkOrder {
@@ -601,6 +755,7 @@ model WorkOrder {
   dispatchedAt DateTime?
   completedAt  DateTime?
   failedAt     DateTime?
+  version      Int               @default(1)
   createdAt    DateTime          @default(now())
   updatedAt    DateTime          @updatedAt
   executions   WorkOrderExecution[]
@@ -611,7 +766,9 @@ model WorkOrder {
   @@index([createdById])
   @@index([executionRunId])
   @@index([status, lastEventAt])
+  @@index([id, version])
   @@map("work_orders")
+  @@schema("orchestration")
 }
 
 model OrchestrationRun {
@@ -639,6 +796,7 @@ model OrchestrationRun {
   @@index([projectId, status])
   @@index([actorId])
   @@map("orchestration_runs")
+  @@schema("orchestration")
 }
 
 model WorkOrderExecution {
@@ -667,12 +825,15 @@ model WorkOrderExecution {
   @@index([workOrderId])
   @@index([artifactId])
   @@map("work_order_executions")
+  @@schema("orchestration")
 }
 
 enum ProjectTimelineVisibility {
   INTERNAL
   TEAM
   CLIENT
+
+  @@schema("projects")
 }
 
 model ProjectTimelineEvent {
@@ -695,6 +856,7 @@ model ProjectTimelineEvent {
   @@index([taskId])
   @@index([artifactId])
   @@map("project_timeline_events")
+  @@schema("projects")
 }
 
 model Notification {
@@ -718,6 +880,7 @@ model Notification {
   @@index([taskId])
   @@index([artifactId])
   @@map("notifications")
+  @@schema("notifications")
 }
 
 // ─── Phase 2A: Agent Memory ────────────────────────────────────────────────────
@@ -758,6 +921,7 @@ model AgentMemory {
   @@index([agentProfileId])
   @@index([approvedAt])
   @@map("agent_memories")
+  @@schema("memory")
 }
 
 model AgentProfile {
@@ -774,6 +938,7 @@ model AgentProfile {
 
   @@index([agentType, active])
   @@map("agent_profiles")
+  @@schema("memory")
 }
 
 enum AgentMemoryScope {
@@ -781,12 +946,16 @@ enum AgentMemoryScope {
   PROJECT_CORE
   PROJECT_AGENT
   GLOBAL_PATTERN
+
+  @@schema("memory")
 }
 
 enum AgentMemoryType {
   SKILL // successful agent prompt+output pairs that passed gate review
   PATTERN // fileManifest + contract that resulted in DELIVERED status
   MISTAKE // rejected artifacts with rejection notes
+
+  @@schema("memory")
 }
 
 // ─── Phase 2B: Run Supervisor ──────────────────────────────────────────────────
@@ -807,6 +976,7 @@ model EventLog {
 
   @@index([projectId, occurredAt])
   @@map("event_logs")
+  @@schema("orchestration")
 }
 
 model RunBudget {
@@ -825,4 +995,126 @@ model RunBudget {
   updatedAt      DateTime @updatedAt
 
   @@map("run_budgets")
+  @@schema("orchestration")
+}
+
+enum AdminDomainStatus {
+  PLANNED
+  PENDING_VERIFICATION
+  VERIFIED
+  FAILED
+  DISABLED
+
+  @@schema("admin")
+}
+
+enum IntegrationOutboxStatus {
+  PENDING
+  PUBLISHED
+  FAILED
+
+  @@schema("integration")
+}
+
+enum IdempotencyRecordStatus {
+  PROCESSING
+  COMPLETED
+  FAILED
+
+  @@schema("integration")
+}
+
+model AdminDomain {
+  id          String            @id @default(cuid())
+  name        String            @unique
+  type        String
+  owner       String?
+  target      String?
+  environment String            @default("production")
+  status      AdminDomainStatus @default(PLANNED)
+  verifiedAt  DateTime?
+  createdById String?           @db.Uuid
+  createdAt   DateTime          @default(now())
+  updatedAt   DateTime          @updatedAt
+
+  @@index([status])
+  @@index([environment])
+  @@map("admin_domains")
+  @@schema("admin")
+}
+
+model AdminAuditLog {
+  id        String   @id @default(cuid())
+  actorId   String?  @db.Uuid
+  actor     Profile? @relation("AdminAuditActor", fields: [actorId], references: [id], onDelete: SetNull)
+  action    String
+  targetType String
+  targetId  String?
+  summary   String
+  metadata  Json     @default("{}")
+  createdAt DateTime @default(now())
+
+  @@index([actorId, createdAt])
+  @@index([targetType, targetId])
+  @@index([action, createdAt])
+  @@map("admin_audit_logs")
+  @@schema("admin")
+}
+
+model PlatformSetting {
+  key         String   @id
+  value       Json     @default("{}")
+  updatedById String?  @db.Uuid
+  updatedAt   DateTime @updatedAt
+  createdAt   DateTime @default(now())
+
+  @@map("platform_settings")
+  @@schema("admin")
+}
+
+model IntegrationOutbox {
+  id            String                  @id @default(cuid())
+  eventType     String
+  aggregateType String
+  aggregateId   String
+  producer      String
+  payload       Json
+  metadata      Json                    @default("{}")
+  status        IntegrationOutboxStatus @default(PENDING)
+  attempts      Int                     @default(0)
+  lockId        String?
+  lockedAt      DateTime?
+  lockedUntil   DateTime?
+  lastAttemptAt DateTime?
+  nextAttemptAt DateTime?
+  publishedAt   DateTime?
+  error         String?                 @db.Text
+  createdAt     DateTime                @default(now())
+
+  @@index([status, lockedUntil, nextAttemptAt, createdAt])
+  @@index([aggregateType, aggregateId, createdAt])
+  @@index([eventType, createdAt])
+  @@map("integration_outbox")
+  @@schema("integration")
+}
+
+model IdempotencyRecord {
+  id             String                  @id @default(cuid())
+  key            String
+  scope          String
+  requestHash    String
+  status         IdempotencyRecordStatus @default(PROCESSING)
+  responseStatus Int?
+  responseBody   Json?
+  error          String?                 @db.Text
+  lockedUntil    DateTime?
+  expiresAt      DateTime
+  createdAt      DateTime                @default(now())
+  updatedAt      DateTime                @updatedAt
+
+  @@unique([key, scope])
+  @@index([scope, expiresAt])
+  @@index([status, lockedUntil])
+  @@map("idempotency_records")
+  @@schema("integration")
 }
