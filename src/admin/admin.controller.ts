@@ -3,6 +3,8 @@ import {
   Controller,
   Delete,
   Get,
+  Headers,
+  HttpStatus,
   Param,
   Patch,
   Post,
@@ -17,6 +19,9 @@ import { AuthUser } from '../auth/auth.types';
 import { Roles } from '../auth/roles.decorator';
 import { RolesGuard } from '../auth/roles.guard';
 import { SupabaseAuthGuard } from '../auth/supabase-auth.guard';
+import { executeIdempotentCommand } from '../shared/idempotency/idempotent-command';
+import { IdempotencyService } from '../shared/idempotency/idempotency.service';
+import { CursorPageInput } from '../shared/pagination/cursor-pagination';
 import {
   CreateAdminDomainDto,
   HandoffOverrideDto,
@@ -33,11 +38,35 @@ import { AdminService } from './admin.service';
 @Roles(UserRole.ADMIN)
 @UsePipes(new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true, transform: true }))
 export class AdminController {
-  constructor(private readonly adminService: AdminService) {}
+  constructor(
+    private readonly adminService: AdminService,
+    private readonly idempotency: IdempotencyService,
+  ) {}
+
+  private runIdempotent<TBody>(
+    idempotencyKey: string | undefined,
+    scope: string,
+    requestPayload: unknown,
+    responseStatus: number,
+    handler: () => Promise<TBody>,
+  ): Promise<TBody> {
+    return executeIdempotentCommand({
+      idempotency: this.idempotency,
+      idempotencyKey,
+      scope,
+      requestPayload,
+      responseStatus,
+      handler,
+    });
+  }
 
   @Get('users')
-  users(@Query('q') q?: string, @Query('role') role?: UserRole) {
-    return this.adminService.listUsers({ q, role });
+  users(
+    @Query('q') q?: string,
+    @Query('role') role?: UserRole,
+    @Query() page?: CursorPageInput,
+  ) {
+    return this.adminService.listUsers({ q, role, page });
   }
 
   @Patch('users/:id/role')
@@ -45,8 +74,15 @@ export class AdminController {
     @Param('id') id: string,
     @Body() dto: UpdateAdminUserRoleDto,
     @CurrentUser() user: AuthUser,
+    @Headers('idempotency-key') idempotencyKey?: string,
   ) {
-    return this.adminService.updateUserRole(id, dto.role, user);
+    return this.runIdempotent(
+      idempotencyKey,
+      `user:${user.id}:PATCH:/admin/users/${id}/role`,
+      dto,
+      HttpStatus.OK,
+      () => this.adminService.updateUserRole(id, dto.role, user),
+    );
   }
 
   @Patch('users/:id/status')
@@ -54,18 +90,35 @@ export class AdminController {
     @Param('id') id: string,
     @Body() dto: UpdateAdminUserStatusDto,
     @CurrentUser() user: AuthUser,
+    @Headers('idempotency-key') idempotencyKey?: string,
   ) {
-    return this.adminService.updateUserStatus(id, dto.status, user);
+    return this.runIdempotent(
+      idempotencyKey,
+      `user:${user.id}:PATCH:/admin/users/${id}/status`,
+      dto,
+      HttpStatus.OK,
+      () => this.adminService.updateUserStatus(id, dto.status, user),
+    );
   }
 
   @Get('domains')
-  domains() {
-    return this.adminService.listDomains();
+  domains(@Query() page?: CursorPageInput) {
+    return this.adminService.listDomains(page);
   }
 
   @Post('domains')
-  createDomain(@Body() dto: CreateAdminDomainDto, @CurrentUser() user: AuthUser) {
-    return this.adminService.createDomain(dto, user);
+  createDomain(
+    @Body() dto: CreateAdminDomainDto,
+    @CurrentUser() user: AuthUser,
+    @Headers('idempotency-key') idempotencyKey?: string,
+  ) {
+    return this.runIdempotent(
+      idempotencyKey,
+      `user:${user.id}:POST:/admin/domains`,
+      dto,
+      HttpStatus.CREATED,
+      () => this.adminService.createDomain(dto, user),
+    );
   }
 
   @Patch('domains/:id')
@@ -73,28 +126,65 @@ export class AdminController {
     @Param('id') id: string,
     @Body() dto: UpdateAdminDomainDto,
     @CurrentUser() user: AuthUser,
+    @Headers('idempotency-key') idempotencyKey?: string,
   ) {
-    return this.adminService.updateDomain(id, dto, user);
+    return this.runIdempotent(
+      idempotencyKey,
+      `user:${user.id}:PATCH:/admin/domains/${id}`,
+      dto,
+      HttpStatus.OK,
+      () => this.adminService.updateDomain(id, dto, user),
+    );
   }
 
   @Post('domains/:id/verify')
-  verifyDomain(@Param('id') id: string, @CurrentUser() user: AuthUser) {
-    return this.adminService.verifyDomain(id, user);
+  verifyDomain(
+    @Param('id') id: string,
+    @CurrentUser() user: AuthUser,
+    @Headers('idempotency-key') idempotencyKey?: string,
+  ) {
+    return this.runIdempotent(
+      idempotencyKey,
+      `user:${user.id}:POST:/admin/domains/${id}/verify`,
+      { domainId: id },
+      HttpStatus.CREATED,
+      () => this.adminService.verifyDomain(id, user),
+    );
   }
 
   @Delete('domains/:id')
-  deleteDomain(@Param('id') id: string, @CurrentUser() user: AuthUser) {
-    return this.adminService.deleteDomain(id, user);
+  deleteDomain(
+    @Param('id') id: string,
+    @CurrentUser() user: AuthUser,
+    @Headers('idempotency-key') idempotencyKey?: string,
+  ) {
+    return this.runIdempotent(
+      idempotencyKey,
+      `user:${user.id}:DELETE:/admin/domains/${id}`,
+      { domainId: id },
+      HttpStatus.OK,
+      () => this.adminService.deleteDomain(id, user),
+    );
   }
 
   @Get('repositories')
-  repositories() {
-    return this.adminService.listRepositories();
+  repositories(@Query() page?: CursorPageInput) {
+    return this.adminService.listRepositories(page);
   }
 
   @Post('projects/:id/repository/create')
-  createRepository(@Param('id') id: string, @CurrentUser() user: AuthUser) {
-    return this.adminService.createRepository(id, user);
+  createRepository(
+    @Param('id') id: string,
+    @CurrentUser() user: AuthUser,
+    @Headers('idempotency-key') idempotencyKey?: string,
+  ) {
+    return this.runIdempotent(
+      idempotencyKey,
+      `user:${user.id}:POST:/admin/projects/${id}/repository/create`,
+      { projectId: id },
+      HttpStatus.CREATED,
+      () => this.adminService.createRepository(id, user),
+    );
   }
 
   @Patch('projects/:id/repository')
@@ -102,13 +192,20 @@ export class AdminController {
     @Param('id') id: string,
     @Body() dto: LinkAdminRepositoryDto,
     @CurrentUser() user: AuthUser,
+    @Headers('idempotency-key') idempotencyKey?: string,
   ) {
-    return this.adminService.linkRepository(id, dto.repoUrl, user);
+    return this.runIdempotent(
+      idempotencyKey,
+      `user:${user.id}:PATCH:/admin/projects/${id}/repository`,
+      dto,
+      HttpStatus.OK,
+      () => this.adminService.linkRepository(id, dto.repoUrl, user),
+    );
   }
 
   @Get('handoffs')
-  handoffs() {
-    return this.adminService.listHandoffs();
+  handoffs(@Query() page?: CursorPageInput) {
+    return this.adminService.listHandoffs(page);
   }
 
   @Post('projects/:id/handoff/override')
@@ -116,8 +213,15 @@ export class AdminController {
     @Param('id') id: string,
     @Body() dto: HandoffOverrideDto,
     @CurrentUser() user: AuthUser,
+    @Headers('idempotency-key') idempotencyKey?: string,
   ) {
-    return this.adminService.overrideHandoff(id, dto, user);
+    return this.runIdempotent(
+      idempotencyKey,
+      `user:${user.id}:POST:/admin/projects/${id}/handoff/override`,
+      dto,
+      HttpStatus.CREATED,
+      () => this.adminService.overrideHandoff(id, dto, user),
+    );
   }
 
   @Get('usage')
@@ -145,7 +249,14 @@ export class AdminController {
     @Param('key') key: string,
     @Body() dto: UpdatePlatformSettingDto,
     @CurrentUser() user: AuthUser,
+    @Headers('idempotency-key') idempotencyKey?: string,
   ) {
-    return this.adminService.updateSetting(key, dto.value, user);
+    return this.runIdempotent(
+      idempotencyKey,
+      `user:${user.id}:PATCH:/admin/settings/${key}`,
+      dto,
+      HttpStatus.OK,
+      () => this.adminService.updateSetting(key, dto.value, user),
+    );
   }
 }

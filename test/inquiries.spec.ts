@@ -12,9 +12,12 @@ import {
   UserRole,
 } from '@prisma/client';
 import { AuthUser } from '../src/auth/auth.types';
+import { IntakeRepository } from '../src/inquiries/intake.repository';
 import { InquiriesService } from '../src/inquiries/inquiries.service';
 import { NotificationsService } from '../src/notifications/notifications.service';
 import { PrismaService } from '../src/prisma/prisma.service';
+import { IntegrationEvents } from '../src/shared/events/integration-event';
+import { OutboxService } from '../src/shared/events/outbox.service';
 
 const pmUser: AuthUser = {
   id: '11111111-1111-4111-8111-111111111111',
@@ -75,11 +78,15 @@ function makePrismaMock() {
       create: vi.fn().mockResolvedValue({ id: 'document-1' }),
     },
     clientInquiry: {
+      create: vi.fn().mockResolvedValue(makeInquiry()),
       update: vi.fn().mockResolvedValue(makeInquiry({
         status: InquiryStatus.APPROVED,
         reviewedById: pmUser.id,
         approvedProjectId: 'project-1',
       })),
+    },
+    integrationOutbox: {
+      create: vi.fn().mockResolvedValue({ id: 'outbox-1' }),
     },
   };
 
@@ -113,9 +120,11 @@ describe('InquiriesService', () => {
   beforeEach(() => {
     prisma = makePrismaMock();
     notifications = makeNotificationsMock();
+    const intakeRepository = new IntakeRepository(prisma as unknown as PrismaService);
     service = new InquiriesService(
-      prisma as unknown as PrismaService,
+      intakeRepository,
       notifications as unknown as NotificationsService,
+      new OutboxService(prisma as unknown as PrismaService),
     );
   });
 
@@ -127,12 +136,20 @@ describe('InquiriesService', () => {
       brief: 'Build a customer portal with payments and admin workflows.',
     });
 
-    expect(prisma.clientInquiry.create).toHaveBeenCalledWith(expect.objectContaining({
+    expect(prisma.tx.clientInquiry.create).toHaveBeenCalledWith(expect.objectContaining({
       data: expect.objectContaining({
         companyName: 'Acme Co',
         contactName: 'Casey Client',
         email: 'casey@example.com',
         stackKey: 'nextjs-nestjs-supabase',
+      }),
+    }));
+    expect(prisma.tx.integrationOutbox.create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({
+        eventType: IntegrationEvents.inquirySubmitted,
+        aggregateType: 'client_inquiry',
+        aggregateId: 'inquiry-1',
+        producer: 'intake',
       }),
     }));
     expect(notifications.notify).toHaveBeenCalledWith(expect.objectContaining({
@@ -148,6 +165,33 @@ describe('InquiriesService', () => {
       where: { status: InquiryStatus.NEW },
       orderBy: { createdAt: 'desc' },
     }));
+  });
+
+  it('returns a cursor page for filtered inquiry lists when pagination is requested', async () => {
+    prisma.clientInquiry.findMany.mockResolvedValue([
+      makeInquiry({ id: 'inquiry-2' }),
+      makeInquiry({ id: 'inquiry-3' }),
+      makeInquiry({ id: 'inquiry-4' }),
+    ]);
+
+    await expect(
+      service.findAll(InquiryStatus.NEW, { limit: '2', cursor: 'inquiry-1' }),
+    ).resolves.toEqual({
+      items: [
+        makeInquiry({ id: 'inquiry-2' }),
+        makeInquiry({ id: 'inquiry-3' }),
+      ],
+      nextCursor: 'inquiry-4',
+    });
+
+    expect(prisma.clientInquiry.findMany).toHaveBeenCalledWith({
+      where: { status: InquiryStatus.NEW },
+      include: expect.any(Object),
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      take: 3,
+      cursor: { id: 'inquiry-1' },
+      skip: 1,
+    });
   });
 
   it('approves an inquiry into a project with collaboration handoff records', async () => {
@@ -189,6 +233,13 @@ describe('InquiriesService', () => {
         visibility: ProjectTimelineVisibility.TEAM,
       }),
     }));
+    expect(prisma.tx.integrationOutbox.create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({
+        eventType: IntegrationEvents.inquiryApproved,
+        aggregateId: 'inquiry-1',
+        producer: 'intake',
+      }),
+    }));
     expect(notifications.notify).toHaveBeenLastCalledWith(expect.objectContaining({
       type: NotificationType.INQUIRY_APPROVED,
       projectId: 'project-1',
@@ -198,11 +249,18 @@ describe('InquiriesService', () => {
   it('rejects an inquiry with reviewer metadata', async () => {
     await service.reject('inquiry-1', pmUser, { reviewNote: 'Outside current scope.' });
 
-    expect(prisma.clientInquiry.update).toHaveBeenCalledWith(expect.objectContaining({
+    expect(prisma.tx.clientInquiry.update).toHaveBeenCalledWith(expect.objectContaining({
       data: expect.objectContaining({
         status: InquiryStatus.REJECTED,
         reviewNote: 'Outside current scope.',
         reviewedById: pmUser.id,
+      }),
+    }));
+    expect(prisma.tx.integrationOutbox.create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({
+        eventType: IntegrationEvents.inquiryRejected,
+        aggregateId: 'inquiry-1',
+        producer: 'intake',
       }),
     }));
   });

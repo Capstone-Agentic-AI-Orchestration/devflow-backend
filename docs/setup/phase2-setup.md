@@ -44,23 +44,21 @@ docker exec devflow-backend-db-1 psql -U devflow -c "SELECT * FROM pg_available_
 
 ---
 
-## Step 2 — Run the Phase 2A migration
+## Step 2 — Apply checked-in migrations
 
-The migration enables the `vector` extension and creates the `agent_memories`, `event_logs`, and `run_budgets` tables.
+The checked-in migrations enable the `vector` extension, create the core DevFlow tables, and add the local Supabase-auth compatibility primitives required by the RLS policies.
 
 ```bash
 # Generate updated Prisma client (picks up new schema)
 npm run prisma:generate
 
-# Run the migration
-npx prisma migrate dev --name phase2a_memory
+# Apply checked-in SQL migrations
+npm run prisma:migrate
 ```
 
 Expected output:
 ```
-Applying migration `20260426_phase2a_memory`
-The following migration(s) have been applied:
-  migrations/20260426_phase2a_memory/migration.sql
+All migrations have been successfully applied.
 ```
 
 Verify the tables exist:

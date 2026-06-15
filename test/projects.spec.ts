@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { BadRequestException, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ConflictException, NotFoundException } from '@nestjs/common';
 import { ArtifactOutputReviewStatus, ArtifactReviewStatus, ArtifactValidationStatus, CollaborationDocumentStatus, NotificationType, OrchestrationRunTrigger, ProjectDeliveryReviewStatus, ProjectKickoffStatus, ProjectStatus, ProjectTimelineEventType, ProjectTimelineVisibility, ProjectTaskActivityType, ProjectTaskStatus, UserRole, WorkOrderAgentType, WorkOrderPriority, WorkOrderStatus } from '@prisma/client';
 import { ProjectsService } from '../src/projects/projects.service';
 import { PrismaService } from '../src/prisma/prisma.service';
@@ -46,6 +46,7 @@ function makePrismaMock() {
       findFirst: vi.fn(),
       findMany: vi.fn().mockResolvedValue([]),
       update: vi.fn().mockResolvedValue({ id: 'project-1' }),
+      updateMany: vi.fn(),
     },
     profile: {
       findFirst: vi.fn(),
@@ -70,6 +71,7 @@ function makePrismaMock() {
       findUnique: vi.fn(),
       upsert: vi.fn(),
       update: vi.fn(),
+      updateMany: vi.fn(),
     },
     clientInvite: {
       findFirst: vi.fn().mockResolvedValue({ id: 'invite-1' }),
@@ -83,6 +85,7 @@ function makePrismaMock() {
       findUnique: vi.fn(),
       create: vi.fn(),
       update: vi.fn(),
+      updateMany: vi.fn(),
     },
     projectTaskActivity: {
       findMany: vi.fn().mockResolvedValue([]),
@@ -93,6 +96,7 @@ function makePrismaMock() {
       findFirst: vi.fn(),
       create: vi.fn(),
       update: vi.fn(),
+      updateMany: vi.fn(),
     },
     orchestrationRun: {
       findMany: vi.fn().mockResolvedValue([]),
@@ -522,6 +526,84 @@ describe('ProjectsService', () => {
     ]);
   });
 
+  it('findAll returns a cursor page when pagination is requested', async () => {
+    prisma.project.findMany.mockResolvedValue([
+      {
+        id: 'project-2',
+        companyName: 'Second Co',
+        status: 'PENDING',
+        createdAt: new Date('2026-05-29T00:00:00.000Z'),
+        updatedAt: new Date('2026-05-29T01:00:00.000Z'),
+        runId: null,
+        kickoff: { status: ProjectKickoffStatus.READY },
+        deliveryReview: null,
+        clientInvites: [{ status: 'ACCEPTED' }],
+        artifacts: [],
+        tasks: [{ status: ProjectTaskStatus.TODO }],
+        workOrders: [{ status: WorkOrderStatus.READY }],
+      },
+      {
+        id: 'project-3',
+        companyName: 'Third Co',
+        status: 'PENDING',
+        createdAt: new Date('2026-05-28T00:00:00.000Z'),
+        updatedAt: new Date('2026-05-28T01:00:00.000Z'),
+        runId: null,
+        kickoff: null,
+        deliveryReview: null,
+        clientInvites: [],
+        artifacts: [],
+        tasks: [],
+        workOrders: [],
+      },
+      {
+        id: 'project-4',
+        companyName: 'Fourth Co',
+        status: 'PENDING',
+        createdAt: new Date('2026-05-27T00:00:00.000Z'),
+        updatedAt: new Date('2026-05-27T01:00:00.000Z'),
+        runId: null,
+        kickoff: null,
+        deliveryReview: null,
+        clientInvites: [],
+        artifacts: [],
+        tasks: [],
+        workOrders: [],
+      },
+    ]);
+
+    await expect(
+      service.findAll(pmUser, { limit: '2', cursor: 'project-1' }),
+    ).resolves.toEqual({
+      items: [
+        expect.objectContaining({
+          id: 'project-2',
+          lifecycle: expect.objectContaining({
+            stage: 'READY_FOR_ORCHESTRATION',
+          }),
+        }),
+        expect.objectContaining({
+          id: 'project-3',
+          lifecycle: expect.any(Object),
+        }),
+      ],
+      nextCursor: 'project-4',
+    });
+
+    expect(prisma.project.findMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: {
+        OR: [
+          { createdById: pmUser.id },
+          { members: { some: { userId: pmUser.id } } },
+        ],
+      },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      take: 3,
+      cursor: { id: 'project-1' },
+      skip: 1,
+    }));
+  });
+
   it('findOne lets DEV users access projects where they are members', async () => {
     prisma.project.findFirst.mockResolvedValue({
       id: 'project-1',
@@ -576,8 +658,35 @@ describe('ProjectsService', () => {
         stackKey: 'nextjs-nestjs-supabase',
         status: undefined,
         repoUrl: undefined,
+        version: { increment: 1 },
       },
     });
+  });
+
+  it('update rejects stale project versions without writing timeline events', async () => {
+    prisma.project.findFirst.mockResolvedValueOnce({ id: 'project-1' });
+    prisma.project.updateMany.mockResolvedValue({ count: 0 });
+
+    await expect(
+      service.update('project-1', pmUser, {
+        companyName: 'New Co',
+        version: 7,
+      }),
+    ).rejects.toThrow(ConflictException);
+
+    expect(prisma.project.updateMany).toHaveBeenCalledWith({
+      where: { id: 'project-1', version: 7 },
+      data: {
+        companyName: 'New Co',
+        brief: undefined,
+        stackKey: undefined,
+        status: undefined,
+        repoUrl: undefined,
+        version: { increment: 1 },
+      },
+    });
+    expect(prisma.projectTimelineEvent.create).not.toHaveBeenCalled();
+    expect(prisma.project.update).not.toHaveBeenCalled();
   });
 
   it('addMember upserts by email and returns project detail', async () => {
@@ -654,6 +763,33 @@ describe('ProjectsService', () => {
     });
   });
 
+  it('findEvents returns a cursor page when pagination is requested', async () => {
+    prisma.project.findFirst.mockResolvedValue({ id: 'project-1' });
+    prisma.eventLog.findMany.mockResolvedValue([
+      { id: 'event-2', projectId: 'project-1' },
+      { id: 'event-3', projectId: 'project-1' },
+      { id: 'event-4', projectId: 'project-1' },
+    ]);
+
+    await expect(
+      service.findEvents('project-1', devUser, { limit: 2, cursor: 'event-1' }),
+    ).resolves.toEqual({
+      items: [
+        { id: 'event-2', projectId: 'project-1' },
+        { id: 'event-3', projectId: 'project-1' },
+      ],
+      nextCursor: 'event-4',
+    });
+
+    expect(prisma.eventLog.findMany).toHaveBeenCalledWith({
+      where: { projectId: 'project-1' },
+      orderBy: [{ occurredAt: 'desc' }, { id: 'desc' }],
+      take: 3,
+      cursor: { id: 'event-1' },
+      skip: 1,
+    });
+  });
+
   it('findTimeline limits CLIENT users to client-visible events', async () => {
     prisma.project.findFirst.mockResolvedValue({ id: 'project-1' });
 
@@ -667,6 +803,45 @@ describe('ProjectsService', () => {
       include: expect.any(Object),
       orderBy: { createdAt: 'desc' },
       take: 100,
+    });
+  });
+
+  it('findTimeline returns a cursor page when pagination is requested', async () => {
+    prisma.project.findFirst.mockResolvedValue({ id: 'project-1' });
+    prisma.projectTimelineEvent.findMany.mockResolvedValue([
+      { id: 'timeline-2', projectId: 'project-1' },
+      { id: 'timeline-3', projectId: 'project-1' },
+      { id: 'timeline-4', projectId: 'project-1' },
+    ]);
+
+    await expect(
+      service.findTimeline('project-1', devUser, {
+        limit: '2',
+        cursor: 'timeline-1',
+      }),
+    ).resolves.toEqual({
+      items: [
+        { id: 'timeline-2', projectId: 'project-1' },
+        { id: 'timeline-3', projectId: 'project-1' },
+      ],
+      nextCursor: 'timeline-4',
+    });
+
+    expect(prisma.projectTimelineEvent.findMany).toHaveBeenCalledWith({
+      where: {
+        projectId: 'project-1',
+        visibility: {
+          in: [
+            ProjectTimelineVisibility.TEAM,
+            ProjectTimelineVisibility.CLIENT,
+          ],
+        },
+      },
+      include: expect.any(Object),
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      take: 3,
+      cursor: { id: 'timeline-1' },
+      skip: 1,
     });
   });
 
@@ -749,6 +924,37 @@ describe('ProjectsService', () => {
         createdAt: true,
       },
       orderBy: { createdAt: 'asc' },
+    });
+  });
+
+  it('findArtifacts returns a cursor page for client-visible artifacts when pagination is requested', async () => {
+    prisma.project.findFirst.mockResolvedValue({ id: 'project-1' });
+    prisma.artifact.findMany.mockResolvedValue([
+      { id: 'artifact-2', projectId: 'project-1' },
+      { id: 'artifact-3', projectId: 'project-1' },
+      { id: 'artifact-4', projectId: 'project-1' },
+    ]);
+
+    await expect(
+      service.findArtifacts('project-1', clientUser, {
+        limit: '2',
+        cursor: 'artifact-1',
+      }),
+    ).resolves.toEqual({
+      items: [
+        { id: 'artifact-2', projectId: 'project-1' },
+        { id: 'artifact-3', projectId: 'project-1' },
+      ],
+      nextCursor: 'artifact-4',
+    });
+
+    expect(prisma.artifact.findMany).toHaveBeenCalledWith({
+      where: { projectId: 'project-1', clientVisible: true },
+      select: expect.any(Object),
+      orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+      take: 3,
+      cursor: { id: 'artifact-1' },
+      skip: 1,
     });
   });
 
@@ -1087,6 +1293,7 @@ describe('ProjectsService', () => {
         revisionResolvedById: null,
         revisionResolvedAt: null,
         resolutionNote: null,
+        version: { increment: 1 },
       },
       create: {
         projectId: 'project-1',
@@ -1202,6 +1409,7 @@ describe('ProjectsService', () => {
         acceptanceNote: 'Looks good.',
         acceptedById: clientUser.id,
         acceptedAt: expect.any(Date),
+        version: { increment: 1 },
       },
       create: {
         projectId: 'project-1',
@@ -1213,8 +1421,48 @@ describe('ProjectsService', () => {
     });
     expect(prisma.project.update).toHaveBeenCalledWith({
       where: { id: 'project-1' },
-      data: { status: ProjectStatus.DELIVERED },
+      data: { status: ProjectStatus.DELIVERED, version: { increment: 1 } },
     });
+  });
+
+  it('acceptDelivery rejects stale delivery review versions without side effects', async () => {
+    prisma.project.findFirst.mockResolvedValue({ id: 'project-1' });
+    prisma.clientInvite.findFirst.mockResolvedValue({ id: 'invite-1' });
+    prisma.artifact.findMany.mockResolvedValue([
+      {
+        id: 'artifact-1',
+        agentType: 'frontend',
+        reviewStatus: ArtifactReviewStatus.APPROVED,
+        revisionHandledAt: null,
+        validationStatus: ArtifactValidationStatus.PASSED,
+      },
+    ]);
+    prisma.collaborationDocument.count.mockResolvedValue(0);
+    prisma.workOrder.findMany
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([{ agentType: WorkOrderAgentType.FRONTEND }]);
+    prisma.projectDeliveryReview.updateMany.mockResolvedValue({ count: 0 });
+
+    await expect(
+      service.acceptDelivery('project-1', clientUser, {
+        note: ' Looks good. ',
+        version: 3,
+      }),
+    ).rejects.toThrow(ConflictException);
+
+    expect(prisma.projectDeliveryReview.updateMany).toHaveBeenCalledWith({
+      where: { projectId: 'project-1', version: 3 },
+      data: {
+        status: ProjectDeliveryReviewStatus.ACCEPTED,
+        acceptanceNote: 'Looks good.',
+        acceptedById: clientUser.id,
+        acceptedAt: expect.any(Date),
+        version: { increment: 1 },
+      },
+    });
+    expect(prisma.project.update).not.toHaveBeenCalled();
+    expect(notifications.notify).not.toHaveBeenCalled();
+    expect(prisma.projectTimelineEvent.create).not.toHaveBeenCalled();
   });
 
   it('findDeliveryReadiness reports concrete final delivery blockers', async () => {
@@ -1287,6 +1535,7 @@ describe('ProjectsService', () => {
         revisionResolvedById: pmUser.id,
         revisionResolvedAt: expect.any(Date),
         resolutionNote: 'Updated the handover package.',
+        version: { increment: 1 },
       },
     });
     expect(notifications.notify).toHaveBeenCalledWith(expect.objectContaining({
@@ -1307,6 +1556,37 @@ describe('ProjectsService', () => {
       },
       include: expect.any(Object),
       orderBy: { updatedAt: 'desc' },
+    });
+  });
+
+  it('findTasks returns a cursor page when pagination is requested', async () => {
+    prisma.project.findFirst.mockResolvedValue({ id: 'project-1' });
+    prisma.projectTask.findMany.mockResolvedValue([
+      { id: 'task-2', projectId: 'project-1' },
+      { id: 'task-3', projectId: 'project-1' },
+      { id: 'task-4', projectId: 'project-1' },
+    ]);
+
+    await expect(
+      service.findTasks('project-1', devUser, { limit: 2, cursor: 'task-1' }),
+    ).resolves.toEqual({
+      items: [
+        { id: 'task-2', projectId: 'project-1' },
+        { id: 'task-3', projectId: 'project-1' },
+      ],
+      nextCursor: 'task-4',
+    });
+
+    expect(prisma.projectTask.findMany).toHaveBeenCalledWith({
+      where: {
+        projectId: 'project-1',
+        assignedToId: devUser.id,
+      },
+      include: expect.any(Object),
+      orderBy: [{ updatedAt: 'desc' }, { id: 'desc' }],
+      take: 3,
+      cursor: { id: 'task-1' },
+      skip: 1,
     });
   });
 
@@ -1409,6 +1689,7 @@ describe('ProjectsService', () => {
         status: ProjectTaskStatus.IN_PROGRESS,
         assignedToId: undefined,
         artifactId: undefined,
+        version: { increment: 1 },
       },
       include: expect.any(Object),
     });
@@ -1443,6 +1724,34 @@ describe('ProjectsService', () => {
     ).rejects.toThrow('Developers can only update task status');
   });
 
+  it('updateTask rejects stale versions without writing activity', async () => {
+    prisma.project.findFirst.mockResolvedValue({ id: 'project-1' });
+    prisma.projectTask.findFirst.mockResolvedValue({
+      id: 'task-1',
+      assignedToId: devUser.id,
+      artifactId: null,
+      status: ProjectTaskStatus.TODO,
+      version: 3,
+    });
+    prisma.projectTask.updateMany.mockResolvedValue({ count: 0 });
+
+    await expect(
+      service.updateTask('project-1', 'task-1', devUser, {
+        status: ProjectTaskStatus.IN_PROGRESS,
+        version: 2,
+      }),
+    ).rejects.toBeInstanceOf(ConflictException);
+
+    expect(prisma.projectTask.updateMany).toHaveBeenCalledWith({
+      where: { id: 'task-1', version: 2 },
+      data: expect.objectContaining({
+        status: ProjectTaskStatus.IN_PROGRESS,
+        version: { increment: 1 },
+      }),
+    });
+    expect(prisma.projectTaskActivity.create).not.toHaveBeenCalled();
+  });
+
   it('findTaskActivity returns task activity for assigned DEV users', async () => {
     prisma.project.findFirst.mockResolvedValue({ id: 'project-1' });
     prisma.projectTask.findFirst.mockResolvedValue({
@@ -1459,6 +1768,44 @@ describe('ProjectsService', () => {
       },
       include: expect.any(Object),
       orderBy: { createdAt: 'asc' },
+    });
+  });
+
+  it('findTaskActivity returns a cursor page when pagination is requested', async () => {
+    prisma.project.findFirst.mockResolvedValue({ id: 'project-1' });
+    prisma.projectTask.findFirst.mockResolvedValue({
+      id: 'task-1',
+      assignedToId: devUser.id,
+    });
+    prisma.projectTaskActivity.findMany.mockResolvedValue([
+      { id: 'activity-2', projectId: 'project-1', taskId: 'task-1' },
+      { id: 'activity-3', projectId: 'project-1', taskId: 'task-1' },
+      { id: 'activity-4', projectId: 'project-1', taskId: 'task-1' },
+    ]);
+
+    await expect(
+      service.findTaskActivity('project-1', 'task-1', devUser, {
+        limit: 2,
+        cursor: 'activity-1',
+      }),
+    ).resolves.toEqual({
+      items: [
+        { id: 'activity-2', projectId: 'project-1', taskId: 'task-1' },
+        { id: 'activity-3', projectId: 'project-1', taskId: 'task-1' },
+      ],
+      nextCursor: 'activity-4',
+    });
+
+    expect(prisma.projectTaskActivity.findMany).toHaveBeenCalledWith({
+      where: {
+        projectId: 'project-1',
+        taskId: 'task-1',
+      },
+      include: expect.any(Object),
+      orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+      take: 3,
+      cursor: { id: 'activity-1' },
+      skip: 1,
     });
   });
 
@@ -1522,6 +1869,40 @@ describe('ProjectsService', () => {
       },
       include: expect.any(Object),
       orderBy: { updatedAt: 'desc' },
+    });
+  });
+
+  it('findWorkOrders returns a cursor page when pagination is requested', async () => {
+    prisma.project.findFirst.mockResolvedValue({ id: 'project-1' });
+    prisma.workOrder.findMany.mockResolvedValue([
+      { id: 'work-order-2', projectId: 'project-1' },
+      { id: 'work-order-3', projectId: 'project-1' },
+      { id: 'work-order-4', projectId: 'project-1' },
+    ]);
+
+    await expect(
+      service.findWorkOrders('project-1', devUser, {
+        limit: 2,
+        cursor: 'work-order-1',
+      }),
+    ).resolves.toEqual({
+      items: [
+        { id: 'work-order-2', projectId: 'project-1' },
+        { id: 'work-order-3', projectId: 'project-1' },
+      ],
+      nextCursor: 'work-order-4',
+    });
+
+    expect(prisma.workOrder.findMany).toHaveBeenCalledWith({
+      where: {
+        projectId: 'project-1',
+        task: { assignedToId: devUser.id },
+      },
+      include: expect.any(Object),
+      orderBy: [{ updatedAt: 'desc' }, { id: 'desc' }],
+      take: 3,
+      cursor: { id: 'work-order-1' },
+      skip: 1,
     });
   });
 
@@ -1664,6 +2045,42 @@ describe('ProjectsService', () => {
     ).rejects.toThrow('Dispatched or completed work orders cannot be re-scoped');
 
     expect(prisma.workOrder.update).not.toHaveBeenCalled();
+  });
+
+  it('updateWorkOrder rejects stale versions without creating timeline events', async () => {
+    prisma.project.findFirst.mockResolvedValue({ id: 'project-1' });
+    prisma.workOrder.findFirst.mockResolvedValue({
+      id: 'work-order-1',
+      projectId: 'project-1',
+      title: 'Build API',
+      instructions: 'Implement the API route.',
+      agentType: WorkOrderAgentType.BACKEND,
+      status: WorkOrderStatus.READY,
+      priority: WorkOrderPriority.NORMAL,
+      taskId: null,
+      artifactId: null,
+      task: null,
+      artifact: null,
+      createdBy: null,
+      version: 4,
+    });
+    prisma.workOrder.updateMany.mockResolvedValue({ count: 0 });
+
+    await expect(
+      service.updateWorkOrder('project-1', 'work-order-1', pmUser, {
+        title: 'Build updated API',
+        version: 3,
+      }),
+    ).rejects.toBeInstanceOf(ConflictException);
+
+    expect(prisma.workOrder.updateMany).toHaveBeenCalledWith({
+      where: { id: 'work-order-1', version: 3 },
+      data: expect.objectContaining({
+        title: 'Build updated API',
+        version: { increment: 1 },
+      }),
+    });
+    expect(prisma.projectTimelineEvent.create).not.toHaveBeenCalled();
   });
 
   it('dispatchWorkOrder marks the order dispatched and notifies stakeholders', async () => {

@@ -1,5 +1,5 @@
 import { ProjectTaskStatus } from '@prisma/client';
-import { IsEnum, IsOptional, IsString, IsUUID, MinLength } from 'class-validator';
+import { IsEnum, IsInt, IsOptional, IsString, IsUUID, Min, MinLength } from 'class-validator';
 
 export class CreateProjectTaskDto {
   @IsString()
@@ -44,4 +44,9 @@ export class UpdateProjectTaskDto {
   @IsOptional()
   @IsString()
   artifactId?: string;
+
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  version?: number;
 }

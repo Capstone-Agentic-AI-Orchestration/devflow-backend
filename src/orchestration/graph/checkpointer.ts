@@ -10,7 +10,9 @@ export async function createCheckpointer(): Promise<PostgresSaver> {
     throw new Error('DATABASE_URL environment variable is not set');
   }
 
-  const checkpointer = PostgresSaver.fromConnString(connectionString);
+  const checkpointer = PostgresSaver.fromConnString(connectionString, {
+    schema: 'orchestration',
+  });
   await checkpointer.setup();
   return checkpointer;
 }

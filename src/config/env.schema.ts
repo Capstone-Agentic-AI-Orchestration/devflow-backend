@@ -70,6 +70,31 @@ export const envSchema = z.object({
     .default('300000')
     .transform((v) => parseInt(v, 10))
     .pipe(z.number().positive()),
+  OUTBOX_RELAY_ENABLED: z.enum(['true', 'false']).optional().default('false'),
+  OUTBOX_RELAY_INTERVAL_MS: z
+    .string()
+    .optional()
+    .default('10000')
+    .transform((v) => parseInt(v, 10))
+    .pipe(z.number().positive()),
+  OUTBOX_RELAY_BATCH_SIZE: z
+    .string()
+    .optional()
+    .default('25')
+    .transform((v) => parseInt(v, 10))
+    .pipe(z.number().int().positive().max(100)),
+  OUTBOX_RELAY_LOCK_MS: z
+    .string()
+    .optional()
+    .default('60000')
+    .transform((v) => parseInt(v, 10))
+    .pipe(z.number().positive()),
+  OUTBOX_RELAY_MAX_ATTEMPTS: z
+    .string()
+    .optional()
+    .default('5')
+    .transform((v) => parseInt(v, 10))
+    .pipe(z.number().int().positive()),
 });
 
 export type EnvSchema = z.infer<typeof envSchema>;

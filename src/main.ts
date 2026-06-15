@@ -2,7 +2,6 @@ import { NestFactory } from '@nestjs/core';
 import { Logger } from '@nestjs/common';
 import type { NestExpressApplication } from '@nestjs/platform-express';
 import { IoAdapter } from '@nestjs/platform-socket.io';
-import type { Request, Response } from 'express';
 import { AppModule } from './app.module';
 
 async function bootstrap(): Promise<void> {
@@ -16,17 +15,12 @@ async function bootstrap(): Promise<void> {
   app.enableCors({
     origin: process.env.CORS_ORIGIN ?? '*',
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'Idempotency-Key'],
   });
 
   // LangSmith auto-instrumentation (Phase 2E — no explicit SDK init needed).
   // The @langchain/core tracer picks up LANGCHAIN_TRACING_V2 + LANGCHAIN_API_KEY
   // from the environment at import time when both vars are set.
-
-  // Simple health probe — used by Dockerfile HEALTHCHECK and load balancers
-  app.use('/health', (_req: Request, res: Response) => {
-    res.json({ status: 'ok' });
-  });
 
   const port = parseInt(process.env.PORT ?? '4000', 10);
   await app.listen(port, '0.0.0.0');

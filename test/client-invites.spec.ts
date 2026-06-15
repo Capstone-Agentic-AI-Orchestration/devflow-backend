@@ -2,7 +2,10 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { ClientInviteStatus, NotificationType, ProjectTimelineEventType, ProjectTimelineVisibility, UserRole } from '@prisma/client';
 import { AuthUser } from '../src/auth/auth.types';
 import { ClientInvitesService } from '../src/client-invites/client-invites.service';
+import { IntakeRepository } from '../src/inquiries/intake.repository';
 import { PrismaService } from '../src/prisma/prisma.service';
+import { IntegrationEvents } from '../src/shared/events/integration-event';
+import { OutboxService } from '../src/shared/events/outbox.service';
 
 const clientUser: AuthUser = {
   id: '22222222-2222-4222-8222-222222222222',
@@ -54,6 +57,9 @@ function makePrismaMock() {
     projectTimelineEvent: {
       create: vi.fn().mockResolvedValue({ id: 'timeline-1' }),
     },
+    integrationOutbox: {
+      create: vi.fn().mockResolvedValue({ id: 'outbox-1' }),
+    },
   };
 
   return {
@@ -83,9 +89,11 @@ describe('ClientInvitesService', () => {
   beforeEach(() => {
     prisma = makePrismaMock();
     notifications = makeNotificationsMock();
+    const intakeRepository = new IntakeRepository(prisma as unknown as PrismaService);
     service = new ClientInvitesService(
-      prisma as unknown as PrismaService,
+      intakeRepository,
       notifications as any,
+      new OutboxService(prisma as unknown as PrismaService),
     );
   });
 
@@ -110,6 +118,41 @@ describe('ClientInvitesService', () => {
         ],
       }),
     }));
+  });
+
+  it('returns a cursor page for authenticated client invites when pagination is requested', async () => {
+    prisma.clientInvite.findMany.mockResolvedValue([
+      makeInvite({ id: 'invite-2' }),
+      makeInvite({ id: 'invite-3' }),
+      makeInvite({ id: 'invite-4' }),
+    ]);
+
+    await expect(
+      service.listMine(clientUser, { limit: 2, cursor: 'invite-1' }),
+    ).resolves.toEqual({
+      items: [
+        makeInvite({ id: 'invite-2' }),
+        makeInvite({ id: 'invite-3' }),
+      ],
+      nextCursor: 'invite-4',
+    });
+
+    expect(prisma.clientInvite.findMany).toHaveBeenCalledWith({
+      where: {
+        OR: [
+          { email: 'client@example.com' },
+          { acceptedById: clientUser.id },
+        ],
+        status: {
+          in: [ClientInviteStatus.PENDING, ClientInviteStatus.ACCEPTED],
+        },
+      },
+      include: expect.any(Object),
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      take: 3,
+      cursor: { id: 'invite-1' },
+      skip: 1,
+    });
   });
 
   it('accepts pending invites by creating memberships', async () => {
@@ -143,6 +186,14 @@ describe('ClientInvitesService', () => {
         visibility: ProjectTimelineVisibility.CLIENT,
       }),
     });
+    expect(prisma.tx.integrationOutbox.create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({
+        eventType: IntegrationEvents.clientInviteAccepted,
+        aggregateType: 'client_invite',
+        aggregateId: 'invite-1',
+        producer: 'intake',
+      }),
+    }));
     expect(notifications.notify).toHaveBeenCalledWith(expect.objectContaining({
       recipientIds: [pmUser.id],
       actorId: clientUser.id,

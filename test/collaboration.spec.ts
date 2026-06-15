@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { BadRequestException, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ConflictException, NotFoundException } from '@nestjs/common';
 import {
   CollaborationDocumentStatus,
   CollaborationVisibility,
@@ -52,6 +52,44 @@ function makeConversation(overrides = {}) {
   };
 }
 
+function makeDocument(overrides = {}) {
+  return {
+    id: 'document-1',
+    projectId: 'project-1',
+    artifactId: null,
+    title: 'Launch checklist',
+    description: null,
+    fileName: null,
+    externalUrl: null,
+    kind: 'GENERAL',
+    status: CollaborationDocumentStatus.UPLOADED,
+    clientVisible: true,
+    uploadedById: pmUser.id,
+    reviewedById: null,
+    reviewNote: null,
+    reviewedAt: null,
+    version: 1,
+    createdAt: new Date('2026-05-28T00:00:00.000Z'),
+    updatedAt: new Date('2026-05-28T00:00:00.000Z'),
+    uploadedBy: null,
+    reviewedBy: null,
+    ...overrides,
+  };
+}
+
+function makeMessage(overrides = {}) {
+  return {
+    id: 'message-1',
+    projectId: 'project-1',
+    conversationId: 'conversation-1',
+    authorId: pmUser.id,
+    body: 'Please review the launch notes.',
+    createdAt: new Date('2026-05-28T00:00:00.000Z'),
+    author: null,
+    ...overrides,
+  };
+}
+
 function makePrismaMock() {
   return {
     project: {
@@ -67,6 +105,7 @@ function makePrismaMock() {
       findMany: vi.fn().mockResolvedValue([]),
       create: vi.fn(),
       count: vi.fn().mockResolvedValue(0),
+      groupBy: vi.fn().mockResolvedValue([]),
     },
     conversationRead: {
       upsert: vi.fn().mockResolvedValue({ id: 'read-1' }),
@@ -76,6 +115,7 @@ function makePrismaMock() {
       findFirst: vi.fn(),
       create: vi.fn(),
       update: vi.fn(),
+      updateMany: vi.fn(),
     },
     artifact: {
       findFirst: vi.fn(),
@@ -124,6 +164,38 @@ describe('CollaborationService', () => {
     });
   });
 
+  it('returns a cursor page for conversations when pagination is requested', async () => {
+    prisma.projectConversation.findMany.mockResolvedValue([
+      makeConversation({ id: 'conversation-1', updatedAt: new Date('2026-05-28T03:00:00.000Z') }),
+      makeConversation({ id: 'conversation-2', updatedAt: new Date('2026-05-28T02:00:00.000Z') }),
+      makeConversation({ id: 'conversation-3', updatedAt: new Date('2026-05-28T01:00:00.000Z') }),
+    ]);
+
+    const page = await service.listConversations('project-1', clientUser, {
+      limit: 2,
+      cursor: 'conversation-cursor',
+    });
+
+    expect(prisma.projectConversation.findMany).toHaveBeenCalledWith({
+      where: {
+        projectId: 'project-1',
+        visibility: { in: [CollaborationVisibility.CLIENT] },
+      },
+      include: expect.any(Object),
+      orderBy: [{ updatedAt: 'desc' }, { id: 'desc' }],
+      take: 3,
+      cursor: { id: 'conversation-cursor' },
+      skip: 1,
+    });
+    expect(page).toEqual({
+      items: [
+        expect.objectContaining({ id: 'conversation-1' }),
+        expect.objectContaining({ id: 'conversation-2' }),
+      ],
+      nextCursor: 'conversation-3',
+    });
+  });
+
   it('prevents developers from creating client-visible conversations', async () => {
     await expect(
       service.createConversation('project-1', devUser, {
@@ -163,6 +235,68 @@ describe('CollaborationService', () => {
       actorId: pmUser.id,
       type: NotificationType.COLLAB_MESSAGE_SENT,
     }));
+  });
+
+  it('returns a cursor page for messages when pagination is requested', async () => {
+    prisma.projectConversation.findFirst.mockResolvedValue(makeConversation());
+    prisma.projectMessage.findMany.mockResolvedValue([
+      makeMessage({ id: 'message-1', createdAt: new Date('2026-05-28T00:00:00.000Z') }),
+      makeMessage({ id: 'message-2', createdAt: new Date('2026-05-28T00:01:00.000Z') }),
+      makeMessage({ id: 'message-3', createdAt: new Date('2026-05-28T00:02:00.000Z') }),
+    ]);
+
+    const page = await service.listMessages('project-1', 'conversation-1', pmUser, {
+      limit: 2,
+      cursor: 'message-cursor',
+    });
+
+    expect(prisma.projectMessage.findMany).toHaveBeenCalledWith({
+      where: { projectId: 'project-1', conversationId: 'conversation-1' },
+      include: expect.any(Object),
+      orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+      take: 3,
+      cursor: { id: 'message-cursor' },
+      skip: 1,
+    });
+    expect(page).toEqual({
+      items: [
+        expect.objectContaining({ id: 'message-1' }),
+        expect.objectContaining({ id: 'message-2' }),
+      ],
+      nextCursor: 'message-3',
+    });
+  });
+
+  it('returns a cursor page for documents when pagination is requested', async () => {
+    prisma.collaborationDocument.findMany.mockResolvedValue([
+      makeDocument({ id: 'document-1', updatedAt: new Date('2026-05-28T03:00:00.000Z') }),
+      makeDocument({ id: 'document-2', updatedAt: new Date('2026-05-28T02:00:00.000Z') }),
+      makeDocument({ id: 'document-3', updatedAt: new Date('2026-05-28T01:00:00.000Z') }),
+    ]);
+
+    const page = await service.listDocuments('project-1', clientUser, {
+      limit: 2,
+      cursor: 'document-cursor',
+    });
+
+    expect(prisma.collaborationDocument.findMany).toHaveBeenCalledWith({
+      where: {
+        projectId: 'project-1',
+        clientVisible: true,
+      },
+      include: expect.any(Object),
+      orderBy: [{ updatedAt: 'desc' }, { id: 'desc' }],
+      take: 3,
+      cursor: { id: 'document-cursor' },
+      skip: 1,
+    });
+    expect(page).toEqual({
+      items: [
+        expect.objectContaining({ id: 'document-1' }),
+        expect.objectContaining({ id: 'document-2' }),
+      ],
+      nextCursor: 'document-3',
+    });
   });
 
   it('forces client uploaded documents to be client-visible approval requests', async () => {
@@ -278,8 +412,66 @@ describe('CollaborationService', () => {
         reviewNote: null,
         reviewedAt: null,
         reviewedById: null,
+        version: { increment: 1 },
       }),
     }));
+  });
+
+  it('rejects stale document metadata updates without writing the document', async () => {
+    prisma.collaborationDocument.findFirst.mockResolvedValue({
+      id: 'document-1',
+      projectId: 'project-1',
+      status: CollaborationDocumentStatus.UPLOADED,
+      clientVisible: false,
+    });
+    prisma.collaborationDocument.updateMany.mockResolvedValue({ count: 0 });
+
+    await expect(
+      service.updateDocument('project-1', 'document-1', pmUser, {
+        title: 'Updated notes',
+        version: 4,
+      }),
+    ).rejects.toBeInstanceOf(ConflictException);
+
+    expect(prisma.collaborationDocument.updateMany).toHaveBeenCalledWith({
+      where: { id: 'document-1', version: 4 },
+      data: expect.objectContaining({
+        title: 'Updated notes',
+        version: { increment: 1 },
+      }),
+    });
+    expect(prisma.collaborationDocument.update).not.toHaveBeenCalled();
+  });
+
+  it('rejects stale document reviews without notifications or timeline entries', async () => {
+    prisma.collaborationDocument.findFirst.mockResolvedValue({
+      id: 'document-1',
+      projectId: 'project-1',
+      status: CollaborationDocumentStatus.APPROVAL_REQUESTED,
+      clientVisible: true,
+    });
+    prisma.collaborationDocument.updateMany.mockResolvedValue({ count: 0 });
+
+    await expect(
+      service.reviewDocument('project-1', 'document-1', clientUser, {
+        status: CollaborationDocumentStatus.APPROVED,
+        reviewNote: 'Looks good.',
+        version: 9,
+      }),
+    ).rejects.toBeInstanceOf(ConflictException);
+
+    expect(prisma.collaborationDocument.updateMany).toHaveBeenCalledWith({
+      where: { id: 'document-1', version: 9 },
+      data: {
+        status: CollaborationDocumentStatus.APPROVED,
+        reviewNote: 'Looks good.',
+        reviewedAt: expect.any(Date),
+        reviewedById: clientUser.id,
+        version: { increment: 1 },
+      },
+    });
+    expect(notifications.notify).not.toHaveBeenCalled();
+    expect(prisma.projectTimelineEvent.create).not.toHaveBeenCalled();
   });
 
   it('rejects review attempts for archived documents', async () => {

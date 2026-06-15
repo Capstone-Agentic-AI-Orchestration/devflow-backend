@@ -1,5 +1,5 @@
 import { WorkOrderAgentType, WorkOrderPriority, WorkOrderStatus } from '@prisma/client';
-import { IsEnum, IsOptional, IsString, MinLength } from 'class-validator';
+import { IsEnum, IsInt, IsOptional, IsString, Min, MinLength } from 'class-validator';
 
 export class CreateWorkOrderDto {
   @IsString()
@@ -55,4 +55,9 @@ export class UpdateWorkOrderDto {
   @IsOptional()
   @IsString()
   artifactId?: string;
+
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  version?: number;
 }

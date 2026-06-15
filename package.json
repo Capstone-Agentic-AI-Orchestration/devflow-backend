@@ -14,6 +14,7 @@
     "lint:fix": "eslint \"{src,test}/**/*.ts\" --fix",
     "test": "vitest run",
     "test:watch": "vitest",
+    "verify:supabase-schema": "node scripts/verify-supabase-schema.mjs",
     "auth:set-role": "node scripts/set-profile-role.mjs",
     "seed:demo": "node scripts/seed-demo-personas.mjs",
     "seed:demo:check": "node scripts/check-demo-personas.mjs",
@@ -22,7 +23,8 @@
     "smoke:github": "npm run build && node scripts/smoke-github-delivery.mjs",
     "smoke:orchestration-readiness": "npm run build && node scripts/smoke-orchestration-readiness.mjs",
     "smoke:langgraph-github": "npm run build && node scripts/smoke-langgraph-github-e2e.mjs",
-    "prisma:migrate": "prisma migrate dev",
+    "prisma:migrate": "prisma migrate deploy",
+    "prisma:migrate:dev": "prisma migrate dev",
     "prisma:generate": "prisma generate",
     "prisma:studio": "prisma studio"
   },

@@ -2,6 +2,12 @@ import { BadRequestException, Injectable, NotFoundException } from '@nestjs/comm
 import { DeveloperAvailabilityStatus, Prisma, ProjectStatus, ProjectTaskStatus, UserRole, WorkOrderStatus } from '@prisma/client';
 import { AuthUser } from '../auth/auth.types';
 import { PrismaService } from '../prisma/prisma.service';
+import {
+  CursorPageInput,
+  cursorQueryArgs,
+  hasCursorPage,
+  toCursorPage,
+} from '../shared/pagination/cursor-pagination';
 import { UpdateDeveloperCapacityDto } from './dto/developer.dto';
 
 type DeveloperRecord = {
@@ -34,13 +40,25 @@ type DeveloperRecord = {
 export class DevelopersService {
   constructor(private readonly prisma: PrismaService) {}
 
-  async list() {
+  async list(page?: CursorPageInput) {
+    const paged = hasCursorPage(page);
     const developers = await this.prisma.profile.findMany({
       where: { role: UserRole.DEV },
       select: this.developerSelect(),
-      orderBy: [{ fullName: 'asc' }, { email: 'asc' }],
-      take: 200,
+      orderBy: paged
+        ? [{ fullName: 'asc' }, { email: 'asc' }, { id: 'asc' }]
+        : [{ fullName: 'asc' }, { email: 'asc' }],
+      ...(paged ? cursorQueryArgs(page) : { take: 200 }),
     });
+
+    if (paged) {
+      const result = toCursorPage(developers, page);
+      return {
+        items: result.items.map((developer) => this.toDeveloperView(developer)),
+        nextCursor: result.nextCursor,
+      };
+    }
+
     return developers.map((developer) => this.toDeveloperView(developer));
   }
 
@@ -120,7 +138,7 @@ export class DevelopersService {
   }
 
   private cleanSkills(skills: string[]): Prisma.InputJsonValue {
-    return skills.map((skill) => skill.trim()).filter(Boolean).slice(0, 20) as Prisma.InputJsonValue;
+    return skills.map((skill) => skill.trim()).filter(Boolean).slice(0, 20);
   }
 
   private developerSelect() {

@@ -1,5 +1,6 @@
 import {
   BadRequestException,
+  ConflictException,
   Injectable,
   Logger,
   NotFoundException,
@@ -21,6 +22,13 @@ import { AddTaskCommentDto } from './dto/task-comment.dto';
 import { CreateWorkOrderDto, UpdateWorkOrderDto } from './dto/work-order.dto';
 import { UpdateProjectKickoffDto } from './dto/project-kickoff.dto';
 import { NotificationsService } from '../notifications/notifications.service';
+import {
+  CursorPage,
+  CursorPageInput,
+  cursorQueryArgs,
+  hasCursorPage,
+  toCursorPage,
+} from '../shared/pagination/cursor-pagination';
 
 type ProjectWithRelations = Project & {
   gates: GateEvent[];
@@ -522,7 +530,11 @@ export class ProjectsService {
     return this.orchestration.verifyLlmProviderAccess();
   }
 
-  async findAll(user: AuthUser): Promise<ProjectListItem[]> {
+  async findAll(
+    user: AuthUser,
+    page?: CursorPageInput,
+  ): Promise<ProjectListItem[] | CursorPage<ProjectListItem>> {
+    const paged = hasCursorPage(page);
     const projects = await this.prisma.project.findMany({
       where: this.projectAccessWhere(user),
       select: {
@@ -565,17 +577,30 @@ export class ProjectsService {
           },
         },
       },
-      orderBy: { createdAt: 'desc' },
+      orderBy: paged
+        ? [{ createdAt: 'desc' }, { id: 'desc' }]
+        : { createdAt: 'desc' },
+      ...(paged ? cursorQueryArgs(page) : {}),
     });
 
-    return projects.map((project) => ({
+    const toProjectListItem = (project: (typeof projects)[number]) => ({
       id: project.id,
       companyName: project.companyName,
       status: project.status,
       createdAt: project.createdAt,
       updatedAt: project.updatedAt,
       lifecycle: this.deriveProjectLifecycle(project),
-    }));
+    });
+
+    if (paged) {
+      const result = toCursorPage(projects, page);
+      return {
+        items: result.items.map(toProjectListItem),
+        nextCursor: result.nextCursor,
+      };
+    }
+
+    return projects.map(toProjectListItem);
   }
 
   async findAllDetails(user: AuthUser): Promise<ProjectWithRelations[]> {
@@ -770,16 +795,23 @@ export class ProjectsService {
   ): Promise<ProjectWithRelations> {
     await this.assertAccessible(id, user);
 
-    await this.prisma.project.update({
-      where: { id },
-      data: {
-        companyName: dto.companyName,
-        brief: dto.brief,
-        stackKey: dto.stackKey,
-        status: dto.status,
-        repoUrl: dto.repoUrl,
-      },
-    });
+    const projectUpdateData = {
+      companyName: dto.companyName,
+      brief: dto.brief,
+      stackKey: dto.stackKey,
+      status: dto.status,
+      repoUrl: dto.repoUrl,
+      version: { increment: 1 },
+    } satisfies Prisma.ProjectUncheckedUpdateManyInput;
+
+    if (dto.version === undefined) {
+      await this.prisma.project.update({
+        where: { id },
+        data: projectUpdateData,
+      });
+    } else {
+      await this.updateProjectWithVersion(id, dto.version, projectUpdateData);
+    }
 
     await this.recordTimelineEvent(id, user, {
       type: ProjectTimelineEventType.PROJECT_UPDATED,
@@ -795,6 +827,23 @@ export class ProjectsService {
     });
 
     return this.findOne(id, user);
+  }
+
+  private async updateProjectWithVersion(
+    id: string,
+    version: number,
+    data: Prisma.ProjectUncheckedUpdateManyInput,
+  ): Promise<void> {
+    const result = await this.prisma.project.updateMany({
+      where: { id, version },
+      data,
+    });
+
+    if (result.count === 0) {
+      throw new ConflictException(
+        `Project ${id} was updated by another request; reload and retry`,
+      );
+    }
   }
 
   async findKickoff(id: string, user: AuthUser): Promise<ProjectKickoff> {
@@ -1034,11 +1083,16 @@ export class ProjectsService {
     return this.findOne(projectId, user);
   }
 
-  async findArtifacts(id: string, user: AuthUser): Promise<ArtifactListItem[]> {
+  async findArtifacts(
+    id: string,
+    user: AuthUser,
+    page?: CursorPageInput,
+  ): Promise<ArtifactListItem[] | CursorPage<ArtifactListItem>> {
     await this.assertAccessible(id, user);
+    const paged = hasCursorPage(page);
 
     if (user.role === UserRole.CLIENT) {
-      return this.prisma.artifact.findMany({
+      const artifacts = await this.prisma.artifact.findMany({
         where: { projectId: id, clientVisible: true },
         select: {
           id: true,
@@ -1066,14 +1120,24 @@ export class ProjectsService {
           revisionResolutionNote: true,
           createdAt: true,
         },
-        orderBy: { createdAt: 'asc' },
+        orderBy: paged
+          ? [{ createdAt: 'asc' }, { id: 'asc' }]
+          : { createdAt: 'asc' },
+        ...(paged ? cursorQueryArgs(page) : {}),
       });
+
+      return paged ? toCursorPage(artifacts, page) : artifacts;
     }
 
-    return this.prisma.artifact.findMany({
+    const artifacts = await this.prisma.artifact.findMany({
       where: { projectId: id },
-      orderBy: { createdAt: 'asc' },
+      orderBy: paged
+        ? [{ createdAt: 'asc' }, { id: 'asc' }]
+        : { createdAt: 'asc' },
+      ...(paged ? cursorQueryArgs(page) : {}),
     });
+
+    return paged ? toCursorPage(artifacts, page) : artifacts;
   }
 
   async findArtifact(
@@ -1500,26 +1564,33 @@ export class ProjectsService {
     }
 
     const note = dto.note?.trim() || null;
-    const review = await this.prisma.projectDeliveryReview.upsert({
-      where: { projectId: id },
-      update: {
-        status: ProjectDeliveryReviewStatus.ACCEPTED,
-        acceptanceNote: note,
-        acceptedById: user.id,
-        acceptedAt: new Date(),
-      },
-      create: {
-        projectId: id,
-        status: ProjectDeliveryReviewStatus.ACCEPTED,
-        acceptanceNote: note,
-        acceptedById: user.id,
-        acceptedAt: new Date(),
-      },
-    });
+    const acceptedAt = new Date();
+    const reviewUpdateData = {
+      status: ProjectDeliveryReviewStatus.ACCEPTED,
+      acceptanceNote: note,
+      acceptedById: user.id,
+      acceptedAt,
+      version: { increment: 1 },
+    } satisfies Prisma.ProjectDeliveryReviewUncheckedUpdateManyInput;
+
+    const review =
+      dto.version === undefined
+        ? await this.prisma.projectDeliveryReview.upsert({
+            where: { projectId: id },
+            update: reviewUpdateData,
+            create: {
+              projectId: id,
+              status: ProjectDeliveryReviewStatus.ACCEPTED,
+              acceptanceNote: note,
+              acceptedById: user.id,
+              acceptedAt,
+            },
+          })
+        : await this.updateDeliveryReviewWithVersion(id, dto.version, reviewUpdateData);
 
     await this.prisma.project.update({
       where: { id },
-      data: { status: ProjectStatus.DELIVERED },
+      data: { status: ProjectStatus.DELIVERED, version: { increment: 1 } },
     });
 
     await this.notifications.notify({
@@ -1555,25 +1626,32 @@ export class ProjectsService {
       throw new BadRequestException('A revision note is required');
     }
 
-    const review = await this.prisma.projectDeliveryReview.upsert({
-      where: { projectId: id },
-      update: {
-        status: ProjectDeliveryReviewStatus.REVISION_REQUESTED,
-        revisionNote: note,
-        revisionRequestedById: user.id,
-        revisionRequestedAt: new Date(),
-        revisionResolvedById: null,
-        revisionResolvedAt: null,
-        resolutionNote: null,
-      },
-      create: {
-        projectId: id,
-        status: ProjectDeliveryReviewStatus.REVISION_REQUESTED,
-        revisionNote: note,
-        revisionRequestedById: user.id,
-        revisionRequestedAt: new Date(),
-      },
-    });
+    const revisionRequestedAt = new Date();
+    const reviewUpdateData = {
+      status: ProjectDeliveryReviewStatus.REVISION_REQUESTED,
+      revisionNote: note,
+      revisionRequestedById: user.id,
+      revisionRequestedAt,
+      revisionResolvedById: null,
+      revisionResolvedAt: null,
+      resolutionNote: null,
+      version: { increment: 1 },
+    } satisfies Prisma.ProjectDeliveryReviewUncheckedUpdateManyInput;
+
+    const review =
+      dto.version === undefined
+        ? await this.prisma.projectDeliveryReview.upsert({
+            where: { projectId: id },
+            update: reviewUpdateData,
+            create: {
+              projectId: id,
+              status: ProjectDeliveryReviewStatus.REVISION_REQUESTED,
+              revisionNote: note,
+              revisionRequestedById: user.id,
+              revisionRequestedAt,
+            },
+          })
+        : await this.updateDeliveryReviewWithVersion(id, dto.version, reviewUpdateData);
 
     await this.notifications.notify({
       recipientIds: await this.notifications.projectManagers(id),
@@ -1613,15 +1691,21 @@ export class ProjectsService {
       throw new BadRequestException('Delivery review does not have an active revision request');
     }
 
-    const review = await this.prisma.projectDeliveryReview.update({
-      where: { projectId: id },
-      data: {
-        status: ProjectDeliveryReviewStatus.REVISION_RESOLVED,
-        revisionResolvedById: user.id,
-        revisionResolvedAt: new Date(),
-        resolutionNote: dto.note?.trim() || null,
-      },
-    });
+    const reviewUpdateData = {
+      status: ProjectDeliveryReviewStatus.REVISION_RESOLVED,
+      revisionResolvedById: user.id,
+      revisionResolvedAt: new Date(),
+      resolutionNote: dto.note?.trim() || null,
+      version: { increment: 1 },
+    } satisfies Prisma.ProjectDeliveryReviewUncheckedUpdateManyInput;
+
+    const review =
+      dto.version === undefined
+        ? await this.prisma.projectDeliveryReview.update({
+            where: { projectId: id },
+            data: reviewUpdateData,
+          })
+        : await this.updateDeliveryReviewWithVersion(id, dto.version, reviewUpdateData);
 
     await this.notifications.notify({
       recipientIds: await this.notifications.projectClients(id),
@@ -1644,7 +1728,38 @@ export class ProjectsService {
     return review;
   }
 
-  async findTasks(id: string, user: AuthUser): Promise<ProjectTaskWithRelations[]> {
+  private async updateDeliveryReviewWithVersion(
+    projectId: string,
+    version: number,
+    data: Prisma.ProjectDeliveryReviewUncheckedUpdateManyInput,
+  ): Promise<ProjectDeliveryReview> {
+    const result = await this.prisma.projectDeliveryReview.updateMany({
+      where: { projectId, version },
+      data,
+    });
+
+    if (result.count === 0) {
+      throw new ConflictException(
+        `Delivery review for project ${projectId} was updated by another request; reload and retry`,
+      );
+    }
+
+    const updated = await this.prisma.projectDeliveryReview.findUnique({
+      where: { projectId },
+    });
+
+    if (!updated) {
+      throw new NotFoundException(`Delivery review for project ${projectId} not found`);
+    }
+
+    return updated;
+  }
+
+  async findTasks(
+    id: string,
+    user: AuthUser,
+    page?: CursorPageInput,
+  ): Promise<ProjectTaskWithRelations[] | CursorPage<ProjectTaskWithRelations>> {
     await this.assertAccessible(id, user);
 
     const where: Prisma.ProjectTaskWhereInput = { projectId: id };
@@ -1652,11 +1767,16 @@ export class ProjectsService {
       where.assignedToId = user.id;
     }
 
-    return this.prisma.projectTask.findMany({
+    const tasks = await this.prisma.projectTask.findMany({
       where,
       include: taskInclude,
-      orderBy: { updatedAt: 'desc' },
+      orderBy: hasCursorPage(page)
+        ? [{ updatedAt: 'desc' }, { id: 'desc' }]
+        : { updatedAt: 'desc' },
+      ...(hasCursorPage(page) ? cursorQueryArgs(page) : {}),
     });
+
+    return hasCursorPage(page) ? toCursorPage(tasks, page) : tasks;
   }
 
   async createTask(
@@ -1798,29 +1918,35 @@ export class ProjectsService {
       await this.assertTaskLinks(id, dto.assignedToId, dto.artifactId);
     }
 
-    const updated = await this.prisma.projectTask.update({
-      where: { id: taskId },
-      data: {
-        title: canManage ? dto.title?.trim() : undefined,
-        description: canManage
-          ? dto.description === undefined
-            ? undefined
-            : dto.description.trim() || null
-          : undefined,
-        status: dto.status,
-        assignedToId: canManage
-          ? dto.assignedToId === undefined
-            ? undefined
-            : dto.assignedToId || null
-          : undefined,
-        artifactId: canManage
-          ? dto.artifactId === undefined
-            ? undefined
-            : dto.artifactId || null
-          : undefined,
-      },
-      include: taskInclude,
-    });
+    const taskUpdateData = {
+      title: canManage ? dto.title?.trim() : undefined,
+      description: canManage
+        ? dto.description === undefined
+          ? undefined
+          : dto.description.trim() || null
+        : undefined,
+      status: dto.status,
+      assignedToId: canManage
+        ? dto.assignedToId === undefined
+          ? undefined
+          : dto.assignedToId || null
+        : undefined,
+      artifactId: canManage
+        ? dto.artifactId === undefined
+          ? undefined
+          : dto.artifactId || null
+        : undefined,
+      version: { increment: 1 },
+    } satisfies Prisma.ProjectTaskUncheckedUpdateManyInput;
+
+    const updated =
+      dto.version === undefined
+        ? await this.prisma.projectTask.update({
+            where: { id: taskId },
+            data: taskUpdateData,
+            include: taskInclude,
+          })
+        : await this.updateTaskWithVersion(id, taskId, dto.version, taskUpdateData);
 
     await this.recordTaskUpdateActivity(id, task, updated, user);
 
@@ -1878,21 +2004,57 @@ export class ProjectsService {
     return updated;
   }
 
+  private async updateTaskWithVersion(
+    projectId: string,
+    taskId: string,
+    version: number,
+    data: Prisma.ProjectTaskUncheckedUpdateManyInput,
+  ): Promise<ProjectTaskWithRelations> {
+    const result = await this.prisma.projectTask.updateMany({
+      where: { id: taskId, version },
+      data,
+    });
+
+    if (result.count === 0) {
+      throw new ConflictException(
+        `Task ${taskId} was updated by another request; reload and retry`,
+      );
+    }
+
+    const updated = await this.prisma.projectTask.findFirst({
+      where: { id: taskId, projectId },
+      include: taskInclude,
+    });
+
+    if (!updated) {
+      throw new NotFoundException(`Task ${taskId} not found`);
+    }
+
+    return updated;
+  }
+
   async findTaskActivity(
     id: string,
     taskId: string,
     user: AuthUser,
-  ): Promise<ProjectTaskActivityWithActor[]> {
+    page?: CursorPageInput,
+  ): Promise<ProjectTaskActivityWithActor[] | CursorPage<ProjectTaskActivityWithActor>> {
     await this.assertTaskAccessible(id, taskId, user);
+    const paged = hasCursorPage(page);
 
-    return this.prisma.projectTaskActivity.findMany({
+    const activity = await this.prisma.projectTaskActivity.findMany({
       where: {
         projectId: id,
         taskId,
       },
       include: taskActivityInclude,
-      orderBy: { createdAt: 'asc' },
+      orderBy: paged
+        ? [{ createdAt: 'asc' }, { id: 'asc' }]
+        : { createdAt: 'asc' },
+      ...(paged ? cursorQueryArgs(page) : {}),
     });
+
+    return paged ? toCursorPage(activity, page) : activity;
   }
 
   async addTaskComment(
@@ -1950,21 +2112,30 @@ export class ProjectsService {
   async findTimeline(
     id: string,
     user: AuthUser,
-  ): Promise<ProjectTimelineEventWithActor[]> {
+    page?: CursorPageInput,
+  ): Promise<ProjectTimelineEventWithActor[] | CursorPage<ProjectTimelineEventWithActor>> {
     await this.assertAccessible(id, user);
 
-    return this.prisma.projectTimelineEvent.findMany({
+    const events = await this.prisma.projectTimelineEvent.findMany({
       where: {
         projectId: id,
         visibility: { in: this.timelineVisibilityFor(user.role) },
       },
       include: timelineInclude,
-      orderBy: { createdAt: 'desc' },
-      take: 100,
+      orderBy: hasCursorPage(page)
+        ? [{ createdAt: 'desc' }, { id: 'desc' }]
+        : { createdAt: 'desc' },
+      ...(hasCursorPage(page) ? cursorQueryArgs(page) : { take: 100 }),
     });
+
+    return hasCursorPage(page) ? toCursorPage(events, page) : events;
   }
 
-  async findWorkOrders(id: string, user: AuthUser): Promise<WorkOrderWithRelations[]> {
+  async findWorkOrders(
+    id: string,
+    user: AuthUser,
+    page?: CursorPageInput,
+  ): Promise<WorkOrderWithRelations[] | CursorPage<WorkOrderWithRelations>> {
     await this.assertAccessible(id, user);
 
     const where: Prisma.WorkOrderWhereInput = { projectId: id };
@@ -1972,11 +2143,16 @@ export class ProjectsService {
       where.task = { assignedToId: user.id };
     }
 
-    return this.prisma.workOrder.findMany({
+    const workOrders = await this.prisma.workOrder.findMany({
       where,
       include: workOrderInclude,
-      orderBy: { updatedAt: 'desc' },
+      orderBy: hasCursorPage(page)
+        ? [{ updatedAt: 'desc' }, { id: 'desc' }]
+        : { updatedAt: 'desc' },
+      ...(hasCursorPage(page) ? cursorQueryArgs(page) : {}),
     });
+
+    return hasCursorPage(page) ? toCursorPage(workOrders, page) : workOrders;
   }
 
   async createWorkOrder(
@@ -2054,21 +2230,27 @@ export class ProjectsService {
     this.assertWorkOrderActionable(dto.instructions, dto.status ?? current.status, current.instructions);
     await this.assertWorkOrderLinks(id, dto.taskId, dto.artifactId);
 
-    const updated = await this.prisma.workOrder.update({
-      where: { id: workOrderId },
-      data: {
-        title: dto.title?.trim(),
-        instructions: dto.instructions === undefined ? undefined : dto.instructions.trim() || null,
-        agentType: dto.agentType,
-        priority: dto.priority,
-        status: dto.status,
-        taskId: dto.taskId === undefined ? undefined : dto.taskId || null,
-        artifactId: dto.artifactId === undefined ? undefined : dto.artifactId || null,
-        completedAt: dto.status === WorkOrderStatus.COMPLETED ? new Date() : undefined,
-        failedAt: dto.status === WorkOrderStatus.FAILED ? new Date() : undefined,
-      },
-      include: workOrderInclude,
-    });
+    const workOrderUpdateData = {
+      title: dto.title?.trim(),
+      instructions: dto.instructions === undefined ? undefined : dto.instructions.trim() || null,
+      agentType: dto.agentType,
+      priority: dto.priority,
+      status: dto.status,
+      taskId: dto.taskId === undefined ? undefined : dto.taskId || null,
+      artifactId: dto.artifactId === undefined ? undefined : dto.artifactId || null,
+      completedAt: dto.status === WorkOrderStatus.COMPLETED ? new Date() : undefined,
+      failedAt: dto.status === WorkOrderStatus.FAILED ? new Date() : undefined,
+      version: { increment: 1 },
+    } satisfies Prisma.WorkOrderUncheckedUpdateManyInput;
+
+    const updated =
+      dto.version === undefined
+        ? await this.prisma.workOrder.update({
+            where: { id: workOrderId },
+            data: workOrderUpdateData,
+            include: workOrderInclude,
+          })
+        : await this.updateWorkOrderWithVersion(id, workOrderId, dto.version, workOrderUpdateData);
 
     if (current.status !== updated.status) {
       await this.recordTimelineEvent(id, user, {
@@ -2082,6 +2264,35 @@ export class ProjectsService {
       });
 
       await this.notifyWorkOrderStakeholders(id, user, updated, NotificationType.WORK_ORDER_STATUS_CHANGED, 'Work order status changed');
+    }
+
+    return updated;
+  }
+
+  private async updateWorkOrderWithVersion(
+    projectId: string,
+    workOrderId: string,
+    version: number,
+    data: Prisma.WorkOrderUncheckedUpdateManyInput,
+  ): Promise<WorkOrderWithRelations> {
+    const result = await this.prisma.workOrder.updateMany({
+      where: { id: workOrderId, version },
+      data,
+    });
+
+    if (result.count === 0) {
+      throw new ConflictException(
+        `Work order ${workOrderId} was updated by another request; reload and retry`,
+      );
+    }
+
+    const updated = await this.prisma.workOrder.findFirst({
+      where: { id: workOrderId, projectId },
+      include: workOrderInclude,
+    });
+
+    if (!updated) {
+      throw new NotFoundException(`Work order ${workOrderId} not found`);
     }
 
     return updated;
@@ -2245,13 +2456,21 @@ export class ProjectsService {
     return executed;
   }
 
-  async findEvents(id: string, user: AuthUser): Promise<EventLog[]> {
+  async findEvents(
+    id: string,
+    user: AuthUser,
+    page?: CursorPageInput,
+  ): Promise<EventLog[] | CursorPage<EventLog>> {
     await this.assertAccessible(id, user);
-    return this.prisma.eventLog.findMany({
+    const events = await this.prisma.eventLog.findMany({
       where: { projectId: id },
-      orderBy: { occurredAt: 'desc' },
-      take: 50,
+      orderBy: hasCursorPage(page)
+        ? [{ occurredAt: 'desc' }, { id: 'desc' }]
+        : { occurredAt: 'desc' },
+      ...(hasCursorPage(page) ? cursorQueryArgs(page) : { take: 50 }),
     });
+
+    return hasCursorPage(page) ? toCursorPage(events, page) : events;
   }
 
   async approveGate1(

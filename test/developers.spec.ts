@@ -19,7 +19,7 @@ const pmUser: AuthUser = {
   role: UserRole.PM,
 };
 
-function developerRecord() {
+function developerRecord(overrides = {}) {
   return {
     id: devUser.id,
     email: devUser.email,
@@ -49,6 +49,7 @@ function developerRecord() {
         },
       },
     ],
+    ...overrides,
   };
 }
 
@@ -84,6 +85,39 @@ describe('DevelopersService', () => {
       assignedProjectCount: 1,
       openTaskCount: 1,
       activeWorkOrderCount: 1,
+    });
+    expect(prisma.profile.findMany).toHaveBeenCalledWith({
+      where: { role: UserRole.DEV },
+      select: expect.any(Object),
+      orderBy: [{ fullName: 'asc' }, { email: 'asc' }],
+      take: 200,
+    });
+  });
+
+  it('returns a cursor page when pagination is requested', async () => {
+    prisma.profile.findMany.mockResolvedValue([
+      developerRecord({ id: 'developer-2', email: 'b@example.com' }),
+      developerRecord({ id: 'developer-3', email: 'c@example.com', memberships: [] }),
+      developerRecord({ id: 'developer-4', email: 'd@example.com', assignedTasks: [] }),
+    ]);
+
+    await expect(
+      service.list({ limit: '2', cursor: 'developer-1' }),
+    ).resolves.toEqual({
+      items: [
+        expect.objectContaining({ userId: 'developer-2', assignedProjectCount: 1 }),
+        expect.objectContaining({ userId: 'developer-3', assignedProjectCount: 0 }),
+      ],
+      nextCursor: 'developer-4',
+    });
+
+    expect(prisma.profile.findMany).toHaveBeenCalledWith({
+      where: { role: UserRole.DEV },
+      select: expect.any(Object),
+      orderBy: [{ fullName: 'asc' }, { email: 'asc' }, { id: 'asc' }],
+      take: 3,
+      cursor: { id: 'developer-1' },
+      skip: 1,
     });
   });
 

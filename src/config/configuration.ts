@@ -91,5 +91,12 @@ export default () => {
       tracingEnabled: process.env.LANGCHAIN_TRACING_V2 === 'true',
       project: process.env.LANGCHAIN_PROJECT ?? 'devflow',
     },
+    outboxRelay: {
+      enabled: env.data.OUTBOX_RELAY_ENABLED === 'true',
+      intervalMs: env.data.OUTBOX_RELAY_INTERVAL_MS,
+      batchSize: env.data.OUTBOX_RELAY_BATCH_SIZE,
+      lockMs: env.data.OUTBOX_RELAY_LOCK_MS,
+      maxAttempts: env.data.OUTBOX_RELAY_MAX_ATTEMPTS,
+    },
   };
 };

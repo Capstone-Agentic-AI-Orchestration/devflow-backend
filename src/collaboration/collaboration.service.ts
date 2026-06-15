@@ -1,4 +1,4 @@
-import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
 import {
   CollaborationDocument,
   CollaborationDocumentStatus,
@@ -15,6 +15,13 @@ import {
 import { AuthUser } from '../auth/auth.types';
 import { PrismaService } from '../prisma/prisma.service';
 import { NotificationsService } from '../notifications/notifications.service';
+import {
+  CursorPage,
+  CursorPageInput,
+  cursorQueryArgs,
+  hasCursorPage,
+  toCursorPage,
+} from '../shared/pagination/cursor-pagination';
 import {
   CreateCollaborationDocumentDto,
   CreateConversationDto,
@@ -77,8 +84,13 @@ export class CollaborationService {
     private readonly notifications: NotificationsService,
   ) {}
 
-  async listConversations(projectId: string, user: AuthUser): Promise<ConversationWithRelations[]> {
+  async listConversations(
+    projectId: string,
+    user: AuthUser,
+    page?: CursorPageInput,
+  ): Promise<ConversationWithRelations[] | CursorPage<ConversationWithRelations>> {
     await this.assertProjectAccessible(projectId, user);
+    const paged = hasCursorPage(page);
 
     const conversations = await this.prisma.projectConversation.findMany({
       where: {
@@ -86,10 +98,14 @@ export class CollaborationService {
         visibility: { in: this.conversationVisibilityFor(user.role) },
       },
       include: conversationInclude(user.id),
-      orderBy: [{ lastMessageAt: 'desc' }, { createdAt: 'desc' }],
+      orderBy: paged
+        ? [{ updatedAt: 'desc' }, { id: 'desc' }]
+        : [{ lastMessageAt: 'desc' }, { createdAt: 'desc' }],
+      ...(paged ? cursorQueryArgs(page) : {}),
     });
 
-    const conversationIds = conversations.map((c) => c.id);
+    const visibleConversations = paged ? toCursorPage(conversations, page).items : conversations;
+    const conversationIds = visibleConversations.map((c) => c.id);
     const unreadCounts = conversationIds.length
       ? await this.prisma.projectMessage.groupBy({
           by: ['conversationId'],
@@ -103,7 +119,7 @@ export class CollaborationService {
 
     const unreadMap = new Map(unreadCounts.map((u) => [u.conversationId, u._count.conversationId]));
 
-    return conversations.map((conversation) => {
+    const items = visibleConversations.map((conversation) => {
       const lastReadAt = conversation.reads[0]?.lastReadAt;
       const totalUnread = unreadMap.get(conversation.id) ?? 0;
       return {
@@ -111,6 +127,10 @@ export class CollaborationService {
         unreadCount: lastReadAt ? Math.max(0, totalUnread) : totalUnread,
       };
     });
+
+    return paged
+      ? { items, nextCursor: toCursorPage(conversations, page).nextCursor }
+      : items;
   }
 
   async createConversation(
@@ -154,18 +174,20 @@ export class CollaborationService {
     projectId: string,
     conversationId: string,
     user: AuthUser,
-  ): Promise<MessageWithAuthor[]> {
+    page?: CursorPageInput,
+  ): Promise<MessageWithAuthor[] | CursorPage<MessageWithAuthor>> {
     await this.assertConversationAccessible(projectId, conversationId, user);
+    const paged = hasCursorPage(page);
 
     const messages = await this.prisma.projectMessage.findMany({
       where: { projectId, conversationId },
       include: messageInclude,
-      orderBy: { createdAt: 'asc' },
-      take: 200,
+      orderBy: paged ? [{ createdAt: 'asc' }, { id: 'asc' }] : { createdAt: 'asc' },
+      ...(paged ? cursorQueryArgs(page) : { take: 200 }),
     });
 
     await this.markConversationRead(projectId, conversationId, user);
-    return messages;
+    return paged ? toCursorPage(messages, page) : messages;
   }
 
   async addMessage(
@@ -243,14 +265,22 @@ export class CollaborationService {
     return { read: true, lastReadAt: now };
   }
 
-  async listDocuments(projectId: string, user: AuthUser): Promise<DocumentWithRelations[]> {
+  async listDocuments(
+    projectId: string,
+    user: AuthUser,
+    page?: CursorPageInput,
+  ): Promise<DocumentWithRelations[] | CursorPage<DocumentWithRelations>> {
     await this.assertProjectAccessible(projectId, user);
+    const paged = hasCursorPage(page);
 
-    return this.prisma.collaborationDocument.findMany({
+    const documents = await this.prisma.collaborationDocument.findMany({
       where: this.documentAccessWhere(projectId, user),
       include: documentInclude,
-      orderBy: { updatedAt: 'desc' },
+      orderBy: paged ? [{ updatedAt: 'desc' }, { id: 'desc' }] : { updatedAt: 'desc' },
+      ...(paged ? cursorQueryArgs(page) : {}),
     });
+
+    return paged ? toCursorPage(documents, page) : documents;
   }
 
   async createDocument(
@@ -318,23 +348,28 @@ export class CollaborationService {
     const nextClientVisible = dto.clientVisible ?? current.clientVisible;
     const nextStatus = this.normalizeUpdatedDocumentStatus(nextClientVisible, dto.status);
 
-    return this.prisma.collaborationDocument.update({
-      where: { id: documentId },
-      data: {
-        artifactId: dto.artifactId === undefined ? undefined : dto.artifactId || null,
-        title: dto.title?.trim(),
-        description: dto.description === undefined ? undefined : dto.description.trim() || null,
-        fileName: dto.fileName === undefined ? undefined : dto.fileName.trim() || null,
-        externalUrl: dto.externalUrl === undefined ? undefined : dto.externalUrl.trim() || null,
-        kind: dto.kind,
-        status: nextStatus,
-        clientVisible: dto.clientVisible,
-        reviewNote: nextStatus === CollaborationDocumentStatus.APPROVAL_REQUESTED ? null : undefined,
-        reviewedAt: nextStatus === CollaborationDocumentStatus.APPROVAL_REQUESTED ? null : undefined,
-        reviewedById: nextStatus === CollaborationDocumentStatus.APPROVAL_REQUESTED ? null : undefined,
-      },
-      include: documentInclude,
-    });
+    const documentUpdateData = {
+      artifactId: dto.artifactId === undefined ? undefined : dto.artifactId || null,
+      title: dto.title?.trim(),
+      description: dto.description === undefined ? undefined : dto.description.trim() || null,
+      fileName: dto.fileName === undefined ? undefined : dto.fileName.trim() || null,
+      externalUrl: dto.externalUrl === undefined ? undefined : dto.externalUrl.trim() || null,
+      kind: dto.kind,
+      status: nextStatus,
+      clientVisible: dto.clientVisible,
+      reviewNote: nextStatus === CollaborationDocumentStatus.APPROVAL_REQUESTED ? null : undefined,
+      reviewedAt: nextStatus === CollaborationDocumentStatus.APPROVAL_REQUESTED ? null : undefined,
+      reviewedById: nextStatus === CollaborationDocumentStatus.APPROVAL_REQUESTED ? null : undefined,
+      version: { increment: 1 },
+    } satisfies Prisma.CollaborationDocumentUncheckedUpdateManyInput;
+
+    return dto.version === undefined
+      ? this.prisma.collaborationDocument.update({
+          where: { id: documentId },
+          data: documentUpdateData,
+          include: documentInclude,
+        })
+      : this.updateDocumentWithVersion(projectId, documentId, dto.version, documentUpdateData);
   }
 
   async reviewDocument(
@@ -356,16 +391,22 @@ export class CollaborationService {
       throw new BadRequestException('Archived documents cannot be reviewed');
     }
 
-    const document = await this.prisma.collaborationDocument.update({
-      where: { id: documentId },
-      data: {
-        status: dto.status,
-        reviewNote: dto.reviewNote?.trim() || null,
-        reviewedAt: new Date(),
-        reviewedById: user.id,
-      },
-      include: documentInclude,
-    });
+    const documentReviewData = {
+      status: dto.status,
+      reviewNote: dto.reviewNote?.trim() || null,
+      reviewedAt: new Date(),
+      reviewedById: user.id,
+      version: { increment: 1 },
+    } satisfies Prisma.CollaborationDocumentUncheckedUpdateManyInput;
+
+    const document =
+      dto.version === undefined
+        ? await this.prisma.collaborationDocument.update({
+            where: { id: documentId },
+            data: documentReviewData,
+            include: documentInclude,
+          })
+        : await this.updateDocumentWithVersion(projectId, documentId, dto.version, documentReviewData);
 
     await this.notifications.notify({
       recipientIds: current.clientVisible
@@ -392,6 +433,35 @@ export class CollaborationService {
     });
 
     return document;
+  }
+
+  private async updateDocumentWithVersion(
+    projectId: string,
+    documentId: string,
+    version: number,
+    data: Prisma.CollaborationDocumentUncheckedUpdateManyInput,
+  ): Promise<DocumentWithRelations> {
+    const result = await this.prisma.collaborationDocument.updateMany({
+      where: { id: documentId, version },
+      data,
+    });
+
+    if (result.count === 0) {
+      throw new ConflictException(
+        `Document ${documentId} was updated by another request; reload and retry`,
+      );
+    }
+
+    const updated = await this.prisma.collaborationDocument.findFirst({
+      where: { id: documentId, projectId },
+      include: documentInclude,
+    });
+
+    if (!updated) {
+      throw new NotFoundException(`Document ${documentId} not found`);
+    }
+
+    return updated;
   }
 
   private async findConversation(

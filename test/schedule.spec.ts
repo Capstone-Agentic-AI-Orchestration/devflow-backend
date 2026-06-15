@@ -34,6 +34,18 @@ function makePrismaMock() {
   };
 }
 
+function makeScheduleEvent(overrides = {}) {
+  return {
+    id: 'event-1',
+    title: 'Client kickoff',
+    startsAt: new Date('2026-06-15T01:00:00.000Z'),
+    endsAt: null,
+    createdAt: new Date('2026-06-14T01:00:00.000Z'),
+    updatedAt: new Date('2026-06-14T01:00:00.000Z'),
+    ...overrides,
+  };
+}
+
 describe('ScheduleService', () => {
   let prisma: ReturnType<typeof makePrismaMock>;
   let service: ScheduleService;
@@ -51,6 +63,33 @@ describe('ScheduleService', () => {
       include: expect.any(Object),
       orderBy: [{ startsAt: 'asc' }, { createdAt: 'asc' }],
       take: 250,
+    });
+  });
+
+  it('returns a cursor page for schedule events when pagination is requested', async () => {
+    prisma.scheduleEvent.findMany.mockResolvedValue([
+      makeScheduleEvent({ id: 'event-2' }),
+      makeScheduleEvent({ id: 'event-3' }),
+      makeScheduleEvent({ id: 'event-4' }),
+    ]);
+
+    await expect(
+      service.list(devUser, { limit: '2', cursor: 'event-1' }),
+    ).resolves.toEqual({
+      items: [
+        expect.objectContaining({ id: 'event-2' }),
+        expect.objectContaining({ id: 'event-3' }),
+      ],
+      nextCursor: 'event-4',
+    });
+
+    expect(prisma.scheduleEvent.findMany).toHaveBeenCalledWith({
+      where: expect.objectContaining({ OR: expect.any(Array) }),
+      include: expect.any(Object),
+      orderBy: [{ startsAt: 'asc' }, { createdAt: 'asc' }, { id: 'asc' }],
+      take: 3,
+      cursor: { id: 'event-1' },
+      skip: 1,
     });
   });
 

@@ -11,6 +11,12 @@ import {
 import { AuthUser } from '../auth/auth.types';
 import { GithubService } from '../github/github.service';
 import { PrismaService } from '../prisma/prisma.service';
+import {
+  CursorPageInput,
+  cursorQueryArgs,
+  hasCursorPage,
+  toCursorPage,
+} from '../shared/pagination/cursor-pagination';
 import { CreateAdminDomainDto, HandoffOverrideDto, UpdateAdminDomainDto } from './dto/admin.dto';
 
 @Injectable()
@@ -22,8 +28,9 @@ export class AdminService {
     private readonly githubService: GithubService,
   ) {}
 
-  async listUsers(input: { q?: string; role?: UserRole }) {
+  async listUsers(input: { q?: string; role?: UserRole; page?: CursorPageInput }) {
     const query = input.q?.trim();
+    const paged = hasCursorPage(input.page);
     const where: Prisma.ProfileWhereInput = {};
     if (input.role && Object.values(UserRole).includes(input.role)) where.role = input.role;
     if (query) {
@@ -46,17 +53,29 @@ export class AdminService {
         memberships: { select: { projectId: true, role: true } },
         createdProjects: { select: { id: true } },
       },
-      orderBy: [{ role: 'asc' }, { email: 'asc' }],
-      take: 200,
+      orderBy: paged
+        ? [{ role: 'asc' }, { email: 'asc' }, { id: 'asc' }]
+        : [{ role: 'asc' }, { email: 'asc' }],
+      ...(paged ? cursorQueryArgs(input.page) : { take: 200 }),
     });
 
-    return users.map((user) => ({
+    const toUserView = (user: (typeof users)[number]) => ({
       ...user,
       projectCount: new Set([
         ...user.memberships.map((member) => member.projectId),
         ...user.createdProjects.map((project) => project.id),
       ]).size,
-    }));
+    });
+
+    if (paged) {
+      const page = toCursorPage(users, input.page);
+      return {
+        items: page.items.map(toUserView),
+        nextCursor: page.nextCursor,
+      };
+    }
+
+    return users.map(toUserView);
   }
 
   async updateUserRole(id: string, role: UserRole, actor: AuthUser) {
@@ -123,8 +142,20 @@ export class AdminService {
     return result;
   }
 
-  listDomains() {
-    return this.prisma.adminDomain.findMany({ orderBy: [{ environment: 'asc' }, { name: 'asc' }] });
+  async listDomains(page?: CursorPageInput) {
+    const paged = hasCursorPage(page);
+    const domains = await this.prisma.adminDomain.findMany({
+      orderBy: paged
+        ? [{ environment: 'asc' }, { name: 'asc' }, { id: 'asc' }]
+        : [{ environment: 'asc' }, { name: 'asc' }],
+      ...(paged ? cursorQueryArgs(page) : {}),
+    });
+
+    if (paged) {
+      return toCursorPage(domains, page);
+    }
+
+    return domains;
   }
 
   async createDomain(dto: CreateAdminDomainDto, actor: AuthUser) {
@@ -181,7 +212,8 @@ export class AdminService {
     return { deleted: true };
   }
 
-  async listRepositories() {
+  async listRepositories(page?: CursorPageInput) {
+    const paged = hasCursorPage(page);
     const projects = await this.prisma.project.findMany({
       select: {
         id: true,
@@ -191,10 +223,11 @@ export class AdminService {
         updatedAt: true,
         runId: true,
       },
-      orderBy: { updatedAt: 'desc' },
+      orderBy: paged ? [{ updatedAt: 'desc' }, { id: 'desc' }] : { updatedAt: 'desc' },
+      ...(paged ? cursorQueryArgs(page) : {}),
     });
 
-    return projects.map((project) => ({
+    const toRepositoryView = (project: (typeof projects)[number]) => ({
       projectId: project.id,
       companyName: project.companyName,
       status: project.status,
@@ -202,7 +235,17 @@ export class AdminService {
       runId: project.runId,
       linked: Boolean(project.repoUrl),
       updatedAt: project.updatedAt,
-    }));
+    });
+
+    if (paged) {
+      const result = toCursorPage(projects, page);
+      return {
+        items: result.items.map(toRepositoryView),
+        nextCursor: result.nextCursor,
+      };
+    }
+
+    return projects.map(toRepositoryView);
   }
 
   async linkRepository(projectId: string, repoUrl: string, actor: AuthUser) {
@@ -227,7 +270,8 @@ export class AdminService {
     };
   }
 
-  async listHandoffs() {
+  async listHandoffs(page?: CursorPageInput) {
+    const paged = hasCursorPage(page);
     const projects = await this.prisma.project.findMany({
       select: {
         id: true,
@@ -239,10 +283,11 @@ export class AdminService {
         artifacts: { select: { clientVisible: true, outputReviewStatus: true, reviewStatus: true } },
         workOrders: { select: { status: true } },
       },
-      orderBy: { updatedAt: 'desc' },
+      orderBy: paged ? [{ updatedAt: 'desc' }, { id: 'desc' }] : { updatedAt: 'desc' },
+      ...(paged ? cursorQueryArgs(page) : {}),
     });
 
-    return projects.map((project) => ({
+    const toHandoffView = (project: (typeof projects)[number]) => ({
       projectId: project.id,
       companyName: project.companyName,
       projectStatus: project.status,
@@ -259,7 +304,17 @@ export class AdminService {
         return activeStatuses.includes(workOrder.status);
       }).length,
       updatedAt: project.updatedAt,
-    }));
+    });
+
+    if (paged) {
+      const result = toCursorPage(projects, page);
+      return {
+        items: result.items.map(toHandoffView),
+        nextCursor: result.nextCursor,
+      };
+    }
+
+    return projects.map(toHandoffView);
   }
 
   async overrideHandoff(projectId: string, dto: HandoffOverrideDto, actor: AuthUser) {
@@ -368,7 +423,7 @@ export class AdminService {
       update: { value: jsonValue, updatedById: actor.id },
       create: { key, value: jsonValue, updatedById: actor.id },
     });
-    this.audit(actor, 'admin.setting.updated', 'setting', key, `Updated platform setting ${key}`, { value: jsonValue } as Prisma.InputJsonValue).catch(() => {});
+    this.audit(actor, 'admin.setting.updated', 'setting', key, `Updated platform setting ${key}`, { value: jsonValue }).catch(() => {});
     return setting;
   }
 

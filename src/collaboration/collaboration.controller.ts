@@ -2,11 +2,13 @@ import {
   Body,
   Controller,
   Get,
+  Headers,
   HttpCode,
   HttpStatus,
   Param,
   Patch,
   Post,
+  Query,
   UseGuards,
   UsePipes,
   ValidationPipe,
@@ -17,6 +19,9 @@ import { AuthUser } from '../auth/auth.types';
 import { Roles } from '../auth/roles.decorator';
 import { RolesGuard } from '../auth/roles.guard';
 import { SupabaseAuthGuard } from '../auth/supabase-auth.guard';
+import { executeIdempotentCommand } from '../shared/idempotency/idempotent-command';
+import { IdempotencyService } from '../shared/idempotency/idempotency.service';
+import { CursorPageInput } from '../shared/pagination/cursor-pagination';
 import { CollaborationService } from './collaboration.service';
 import {
   CreateCollaborationDocumentDto,
@@ -29,12 +34,36 @@ import {
 @Controller('projects/:projectId')
 @UseGuards(SupabaseAuthGuard, RolesGuard)
 export class CollaborationController {
-  constructor(private readonly collaborationService: CollaborationService) {}
+  constructor(
+    private readonly collaborationService: CollaborationService,
+    private readonly idempotency: IdempotencyService,
+  ) {}
+
+  private runIdempotent<TBody>(
+    idempotencyKey: string | undefined,
+    scope: string,
+    requestPayload: unknown,
+    responseStatus: number,
+    handler: () => Promise<TBody>,
+  ): Promise<TBody> {
+    return executeIdempotentCommand({
+      idempotency: this.idempotency,
+      idempotencyKey,
+      scope,
+      requestPayload,
+      responseStatus,
+      handler,
+    });
+  }
 
   @Get('conversations')
   @Roles(UserRole.CLIENT, UserRole.PM, UserRole.DEV, UserRole.ADMIN)
-  listConversations(@Param('projectId') projectId: string, @CurrentUser() user: AuthUser) {
-    return this.collaborationService.listConversations(projectId, user);
+  listConversations(
+    @Param('projectId') projectId: string,
+    @CurrentUser() user: AuthUser,
+    @Query() page?: CursorPageInput,
+  ) {
+    return this.collaborationService.listConversations(projectId, user, page);
   }
 
   @Post('conversations')
@@ -45,8 +74,15 @@ export class CollaborationController {
     @Param('projectId') projectId: string,
     @Body() dto: CreateConversationDto,
     @CurrentUser() user: AuthUser,
+    @Headers('idempotency-key') idempotencyKey?: string,
   ) {
-    return this.collaborationService.createConversation(projectId, user, dto);
+    return this.runIdempotent(
+      idempotencyKey,
+      `user:${user.id}:POST:/projects/${projectId}/conversations`,
+      dto,
+      HttpStatus.CREATED,
+      () => this.collaborationService.createConversation(projectId, user, dto),
+    );
   }
 
   @Get('conversations/:conversationId/messages')
@@ -55,8 +91,9 @@ export class CollaborationController {
     @Param('projectId') projectId: string,
     @Param('conversationId') conversationId: string,
     @CurrentUser() user: AuthUser,
+    @Query() page?: CursorPageInput,
   ) {
-    return this.collaborationService.listMessages(projectId, conversationId, user);
+    return this.collaborationService.listMessages(projectId, conversationId, user, page);
   }
 
   @Post('conversations/:conversationId/messages')
@@ -68,8 +105,15 @@ export class CollaborationController {
     @Param('conversationId') conversationId: string,
     @Body() dto: CreateMessageDto,
     @CurrentUser() user: AuthUser,
+    @Headers('idempotency-key') idempotencyKey?: string,
   ) {
-    return this.collaborationService.addMessage(projectId, conversationId, user, dto);
+    return this.runIdempotent(
+      idempotencyKey,
+      `user:${user.id}:POST:/projects/${projectId}/conversations/${conversationId}/messages`,
+      dto,
+      HttpStatus.CREATED,
+      () => this.collaborationService.addMessage(projectId, conversationId, user, dto),
+    );
   }
 
   @Patch('conversations/:conversationId/read')
@@ -78,14 +122,25 @@ export class CollaborationController {
     @Param('projectId') projectId: string,
     @Param('conversationId') conversationId: string,
     @CurrentUser() user: AuthUser,
+    @Headers('idempotency-key') idempotencyKey?: string,
   ) {
-    return this.collaborationService.markConversationRead(projectId, conversationId, user);
+    return this.runIdempotent(
+      idempotencyKey,
+      `user:${user.id}:PATCH:/projects/${projectId}/conversations/${conversationId}/read`,
+      { projectId, conversationId },
+      HttpStatus.OK,
+      () => this.collaborationService.markConversationRead(projectId, conversationId, user),
+    );
   }
 
   @Get('documents')
   @Roles(UserRole.CLIENT, UserRole.PM, UserRole.DEV, UserRole.ADMIN)
-  listDocuments(@Param('projectId') projectId: string, @CurrentUser() user: AuthUser) {
-    return this.collaborationService.listDocuments(projectId, user);
+  listDocuments(
+    @Param('projectId') projectId: string,
+    @CurrentUser() user: AuthUser,
+    @Query() page?: CursorPageInput,
+  ) {
+    return this.collaborationService.listDocuments(projectId, user, page);
   }
 
   @Post('documents')
@@ -96,8 +151,15 @@ export class CollaborationController {
     @Param('projectId') projectId: string,
     @Body() dto: CreateCollaborationDocumentDto,
     @CurrentUser() user: AuthUser,
+    @Headers('idempotency-key') idempotencyKey?: string,
   ) {
-    return this.collaborationService.createDocument(projectId, user, dto);
+    return this.runIdempotent(
+      idempotencyKey,
+      `user:${user.id}:POST:/projects/${projectId}/documents`,
+      dto,
+      HttpStatus.CREATED,
+      () => this.collaborationService.createDocument(projectId, user, dto),
+    );
   }
 
   @Patch('documents/:documentId')
@@ -108,8 +170,15 @@ export class CollaborationController {
     @Param('documentId') documentId: string,
     @Body() dto: UpdateCollaborationDocumentDto,
     @CurrentUser() user: AuthUser,
+    @Headers('idempotency-key') idempotencyKey?: string,
   ) {
-    return this.collaborationService.updateDocument(projectId, documentId, user, dto);
+    return this.runIdempotent(
+      idempotencyKey,
+      `user:${user.id}:PATCH:/projects/${projectId}/documents/${documentId}`,
+      dto,
+      HttpStatus.OK,
+      () => this.collaborationService.updateDocument(projectId, documentId, user, dto),
+    );
   }
 
   @Post('documents/:documentId/review')
@@ -120,7 +189,14 @@ export class CollaborationController {
     @Param('documentId') documentId: string,
     @Body() dto: ReviewCollaborationDocumentDto,
     @CurrentUser() user: AuthUser,
+    @Headers('idempotency-key') idempotencyKey?: string,
   ) {
-    return this.collaborationService.reviewDocument(projectId, documentId, user, dto);
+    return this.runIdempotent(
+      idempotencyKey,
+      `user:${user.id}:POST:/projects/${projectId}/documents/${documentId}/review`,
+      dto,
+      HttpStatus.OK,
+      () => this.collaborationService.reviewDocument(projectId, documentId, user, dto),
+    );
   }
 }

@@ -188,7 +188,7 @@ export class MemoryService {
         this.queryMemoriesWithVector(
           vectorSql,
           Prisma.sql`
-            "scope" = 'PROJECT_CORE'::"AgentMemoryScope"
+            "scope" = 'PROJECT_CORE'::memory."AgentMemoryScope"
             AND "projectId" = ${input.projectId}
             AND "approvedAt" IS NOT NULL
             AND ("expiresAt" IS NULL OR "expiresAt" > NOW())
@@ -198,10 +198,10 @@ export class MemoryService {
         this.queryMemoriesWithVector(
           vectorSql,
           Prisma.sql`
-            "scope" = 'PROJECT_AGENT'::"AgentMemoryScope"
+            "scope" = 'PROJECT_AGENT'::memory."AgentMemoryScope"
             AND "agentType" = ${input.agentType}
             AND "projectId" = ${input.projectId}
-            AND "memoryType" <> 'MISTAKE'::"AgentMemoryType"
+            AND "memoryType" <> 'MISTAKE'::memory."AgentMemoryType"
             AND ("expiresAt" IS NULL OR "expiresAt" > NOW())
           `,
           topK,
@@ -209,10 +209,10 @@ export class MemoryService {
         this.queryMemoriesWithVector(
           vectorSql,
           Prisma.sql`
-            "scope" = 'AGENT_PRIVATE'::"AgentMemoryScope"
+            "scope" = 'AGENT_PRIVATE'::memory."AgentMemoryScope"
             AND "agentType" = ${input.agentType}
             AND "projectId" IS NULL
-            AND "memoryType" <> 'MISTAKE'::"AgentMemoryType"
+            AND "memoryType" <> 'MISTAKE'::memory."AgentMemoryType"
             AND ("expiresAt" IS NULL OR "expiresAt" > NOW())
           `,
           topK,
@@ -221,10 +221,10 @@ export class MemoryService {
           vectorSql,
           Prisma.sql`
             "agentType" = ${input.agentType}
-            AND "memoryType" = 'MISTAKE'::"AgentMemoryType"
+            AND "memoryType" = 'MISTAKE'::memory."AgentMemoryType"
             AND (
-              ("scope" = 'PROJECT_AGENT'::"AgentMemoryScope" AND "projectId" = ${input.projectId})
-              OR ("scope" = 'AGENT_PRIVATE'::"AgentMemoryScope" AND "projectId" IS NULL)
+              ("scope" = 'PROJECT_AGENT'::memory."AgentMemoryScope" AND "projectId" = ${input.projectId})
+              OR ("scope" = 'AGENT_PRIVATE'::memory."AgentMemoryScope" AND "projectId" IS NULL)
             )
             AND ("expiresAt" IS NULL OR "expiresAt" > NOW())
           `,
@@ -233,7 +233,7 @@ export class MemoryService {
         this.queryMemoriesWithVector(
           vectorSql,
           Prisma.sql`
-            "scope" = 'GLOBAL_PATTERN'::"AgentMemoryScope"
+            "scope" = 'GLOBAL_PATTERN'::memory."AgentMemoryScope"
             AND "approvedAt" IS NOT NULL
             AND ("expiresAt" IS NULL OR "expiresAt" > NOW())
           `,
@@ -459,10 +459,10 @@ export class MemoryService {
           fileQuery,
           Prisma.sql`
             "agentType" = ${agentType}
-            AND "memoryType" = 'SKILL'::"AgentMemoryType"
+            AND "memoryType" = 'SKILL'::memory."AgentMemoryType"
             AND (
-              ("scope" = 'PROJECT_AGENT'::"AgentMemoryScope" AND "projectId" = ${projectId})
-              OR ("scope" = 'AGENT_PRIVATE'::"AgentMemoryScope" AND "projectId" IS NULL)
+              ("scope" = 'PROJECT_AGENT'::memory."AgentMemoryScope" AND "projectId" = ${projectId})
+              OR ("scope" = 'AGENT_PRIVATE'::memory."AgentMemoryScope" AND "projectId" IS NULL)
             )
             AND ("expiresAt" IS NULL OR "expiresAt" > NOW())
           `,
@@ -512,7 +512,7 @@ export class MemoryService {
         "approvalSource",
         "createdAt",
         1 - (embedding <=> ${vectorSql}::vector) AS similarity
-      FROM agent_memories
+      FROM memory.agent_memories
       WHERE ${where}
       ORDER BY embedding <=> ${vectorSql}::vector
       LIMIT ${topK}
@@ -545,7 +545,7 @@ export class MemoryService {
       const vectorSql = EmbeddingService.toSql(vector);
 
       await this.prisma.$executeRaw`
-        INSERT INTO agent_memories (
+        INSERT INTO memory.agent_memories (
           id,
           "agentType",
           "agentProfileId",
@@ -566,8 +566,8 @@ export class MemoryService {
           gen_random_uuid()::text,
           ${input.agentType},
           ${input.agentProfileId ?? null},
-          ${input.scope}::"AgentMemoryScope",
-          ${input.memoryType}::"AgentMemoryType",
+          ${input.scope}::memory."AgentMemoryScope",
+          ${input.memoryType}::memory."AgentMemoryType",
           ${input.content},
           ${vectorSql}::vector,
           ${JSON.stringify(input.metadata)}::jsonb,

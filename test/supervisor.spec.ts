@@ -96,7 +96,7 @@ describe('RunSupervisorService', () => {
     const sql = strings.join(' ');
 
     expect(sql).toContain('CAST(');
-    expect(sql).toContain('AS "ProjectStatus"');
+    expect(sql).toContain('AS projects."ProjectStatus"');
     expect(sql).toContain('p.status IN');
     expect(sql).toContain('last_event."lastEventAt" IS NULL');
     expect(sql).toContain('last_event."lastEventAt" <');

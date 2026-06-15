@@ -1,34 +1,23 @@
 import { Injectable } from '@nestjs/common';
-import { ClientInvite, ClientInviteStatus, NotificationType, Prisma, ProjectTimelineEventType, ProjectTimelineVisibility, UserRole } from '@prisma/client';
+import { ClientInviteStatus, NotificationType, UserRole } from '@prisma/client';
 import { AuthUser } from '../auth/auth.types';
+import { IntakeRepository, type InviteView } from '../inquiries/intake.repository';
 import { NotificationsService } from '../notifications/notifications.service';
-import { PrismaService } from '../prisma/prisma.service';
-
-type InviteView = ClientInvite & {
-  project: {
-    id: string;
-    companyName: string;
-    status: string;
-    createdAt: Date;
-  };
-};
-
-const inviteInclude = {
-  project: {
-    select: {
-      id: true,
-      companyName: true,
-      status: true,
-      createdAt: true,
-    },
-  },
-} satisfies Prisma.ClientInviteInclude;
+import { IntegrationEvents } from '../shared/events/integration-event';
+import { OutboxService } from '../shared/events/outbox.service';
+import {
+  CursorPage,
+  CursorPageInput,
+  hasCursorPage,
+  toCursorPage,
+} from '../shared/pagination/cursor-pagination';
 
 @Injectable()
 export class ClientInvitesService {
   constructor(
-    private readonly prisma: PrismaService,
+    private readonly intakeRepository: IntakeRepository,
     private readonly notifications: NotificationsService,
+    private readonly outbox: OutboxService,
   ) {}
 
   async publicStatus(email: string): Promise<{
@@ -38,11 +27,7 @@ export class ClientInvitesService {
     latestCompanyName: string | null;
   }> {
     const normalizedEmail = email.trim().toLowerCase();
-    const invites = await this.prisma.clientInvite.findMany({
-      where: { email: normalizedEmail, status: { in: [ClientInviteStatus.PENDING, ClientInviteStatus.ACCEPTED] } },
-      orderBy: { createdAt: 'desc' },
-      take: 20,
-    });
+    const invites = await this.intakeRepository.findInvitesForStatus(normalizedEmail);
 
     return {
       email: normalizedEmail,
@@ -52,18 +37,13 @@ export class ClientInvitesService {
     };
   }
 
-  listMine(user: AuthUser): Promise<InviteView[]> {
-    return this.prisma.clientInvite.findMany({
-      where: {
-        OR: [
-          { email: user.email?.toLowerCase() ?? '' },
-          { acceptedById: user.id },
-        ],
-        status: { in: [ClientInviteStatus.PENDING, ClientInviteStatus.ACCEPTED] },
-      },
-      include: inviteInclude,
-      orderBy: { createdAt: 'desc' },
-    });
+  async listMine(
+    user: AuthUser,
+    page?: CursorPageInput,
+  ): Promise<InviteView[] | CursorPage<InviteView>> {
+    const invites = await this.intakeRepository.findInvitesForUser(user, page);
+
+    return hasCursorPage(page) ? toCursorPage(invites, page) : invites;
   }
 
   async acceptMine(user: AuthUser): Promise<{ accepted: InviteView[] }> {
@@ -91,64 +71,26 @@ export class ClientInvitesService {
 
     const normalizedEmail = input.email.trim().toLowerCase();
 
-    const accepted = await this.prisma.$transaction(async (tx) => {
-      const pending = await tx.clientInvite.findMany({
-        where: {
-          email: normalizedEmail,
-          status: ClientInviteStatus.PENDING,
+    const accepted = await this.intakeRepository.transaction(async (tx) => this.intakeRepository.acceptPendingInvites(
+      tx,
+      { profileId: input.profileId, email: normalizedEmail },
+      (invite) => this.outbox.append(
+        {
+          eventType: IntegrationEvents.clientInviteAccepted,
+          aggregateType: 'client_invite',
+          aggregateId: invite.id,
+          producer: 'intake',
+          payload: {
+            inviteId: invite.id,
+            projectId: invite.projectId,
+            profileId: input.profileId,
+            email: normalizedEmail,
+          },
+          metadata: { actorId: input.profileId },
         },
-        include: inviteInclude,
-        orderBy: { createdAt: 'asc' },
-      });
-
-      for (const invite of pending) {
-        await tx.projectMember.upsert({
-          where: {
-            projectId_userId: {
-              projectId: invite.projectId,
-              userId: input.profileId,
-            },
-          },
-          update: { role: UserRole.CLIENT },
-          create: {
-            projectId: invite.projectId,
-            userId: input.profileId,
-            role: UserRole.CLIENT,
-          },
-        });
-
-        await tx.clientInvite.update({
-          where: { id: invite.id },
-          data: {
-            status: ClientInviteStatus.ACCEPTED,
-            acceptedById: input.profileId,
-            acceptedAt: new Date(),
-          },
-        });
-
-        await tx.projectTimelineEvent.create({
-          data: {
-            projectId: invite.projectId,
-            actorId: input.profileId,
-            type: ProjectTimelineEventType.CLIENT_INVITE_ACCEPTED,
-            visibility: ProjectTimelineVisibility.CLIENT,
-            title: 'Client invite accepted',
-            body: invite.companyName,
-            metadata: { inviteId: invite.id, email: normalizedEmail },
-          },
-        });
-      }
-
-      if (pending.length === 0) {
-        return [];
-      }
-
-      return tx.clientInvite.findMany({
-        where: { id: { in: pending.map((invite) => invite.id) } },
-        include: inviteInclude,
-        orderBy: { createdAt: 'desc' },
-      });
-    });
+        tx,
+      ),
+    ));
 
     for (const invite of accepted) {
       await this.notifications.notify({

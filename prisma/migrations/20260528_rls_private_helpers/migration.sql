@@ -110,53 +110,69 @@ CREATE POLICY "run_budgets_select_accessible_project"
   TO authenticated
   USING (private.can_access_project("projectId"));
 
-DROP POLICY IF EXISTS "deny_client_access" ON public._prisma_migrations;
-CREATE POLICY "deny_client_access"
-  ON public._prisma_migrations
-  FOR ALL
-  TO anon, authenticated
-  USING (false)
-  WITH CHECK (false);
+DO $$
+BEGIN
+  IF to_regclass('public._prisma_migrations') IS NOT NULL THEN
+    DROP POLICY IF EXISTS "deny_client_access" ON public._prisma_migrations;
+    CREATE POLICY "deny_client_access"
+      ON public._prisma_migrations
+      FOR ALL
+      TO anon, authenticated
+      USING (false)
+      WITH CHECK (false);
+  END IF;
 
-DROP POLICY IF EXISTS "deny_client_access" ON public.agent_memories;
-CREATE POLICY "deny_client_access"
-  ON public.agent_memories
-  FOR ALL
-  TO anon, authenticated
-  USING (false)
-  WITH CHECK (false);
+  IF to_regclass('public.agent_memories') IS NOT NULL THEN
+    DROP POLICY IF EXISTS "deny_client_access" ON public.agent_memories;
+    CREATE POLICY "deny_client_access"
+      ON public.agent_memories
+      FOR ALL
+      TO anon, authenticated
+      USING (false)
+      WITH CHECK (false);
+  END IF;
 
-DROP POLICY IF EXISTS "deny_client_access" ON public.checkpoint_migrations;
-CREATE POLICY "deny_client_access"
-  ON public.checkpoint_migrations
-  FOR ALL
-  TO anon, authenticated
-  USING (false)
-  WITH CHECK (false);
+  IF to_regclass('public.checkpoint_migrations') IS NOT NULL THEN
+    DROP POLICY IF EXISTS "deny_client_access" ON public.checkpoint_migrations;
+    CREATE POLICY "deny_client_access"
+      ON public.checkpoint_migrations
+      FOR ALL
+      TO anon, authenticated
+      USING (false)
+      WITH CHECK (false);
+  END IF;
 
-DROP POLICY IF EXISTS "deny_client_access" ON public.checkpoints;
-CREATE POLICY "deny_client_access"
-  ON public.checkpoints
-  FOR ALL
-  TO anon, authenticated
-  USING (false)
-  WITH CHECK (false);
+  IF to_regclass('public.checkpoints') IS NOT NULL THEN
+    DROP POLICY IF EXISTS "deny_client_access" ON public.checkpoints;
+    CREATE POLICY "deny_client_access"
+      ON public.checkpoints
+      FOR ALL
+      TO anon, authenticated
+      USING (false)
+      WITH CHECK (false);
+  END IF;
 
-DROP POLICY IF EXISTS "deny_client_access" ON public.checkpoint_blobs;
-CREATE POLICY "deny_client_access"
-  ON public.checkpoint_blobs
-  FOR ALL
-  TO anon, authenticated
-  USING (false)
-  WITH CHECK (false);
+  IF to_regclass('public.checkpoint_blobs') IS NOT NULL THEN
+    DROP POLICY IF EXISTS "deny_client_access" ON public.checkpoint_blobs;
+    CREATE POLICY "deny_client_access"
+      ON public.checkpoint_blobs
+      FOR ALL
+      TO anon, authenticated
+      USING (false)
+      WITH CHECK (false);
+  END IF;
 
-DROP POLICY IF EXISTS "deny_client_access" ON public.checkpoint_writes;
-CREATE POLICY "deny_client_access"
-  ON public.checkpoint_writes
-  FOR ALL
-  TO anon, authenticated
-  USING (false)
-  WITH CHECK (false);
+  IF to_regclass('public.checkpoint_writes') IS NOT NULL THEN
+    DROP POLICY IF EXISTS "deny_client_access" ON public.checkpoint_writes;
+    CREATE POLICY "deny_client_access"
+      ON public.checkpoint_writes
+      FOR ALL
+      TO anon, authenticated
+      USING (false)
+      WITH CHECK (false);
+  END IF;
+END
+$$;
 
 DROP FUNCTION IF EXISTS public.can_access_project(text);
 DROP FUNCTION IF EXISTS public.is_platform_manager();

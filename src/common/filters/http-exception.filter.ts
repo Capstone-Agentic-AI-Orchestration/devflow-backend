@@ -36,11 +36,19 @@ export class HttpExceptionFilter implements ExceptionFilter {
       message = exception.message;
     }
 
+    const title =
+      Array.isArray(message) || !message
+        ? exception.name || 'HTTP Exception'
+        : message;
+
     const body: Record<string, unknown> = {
-      statusCode: status,
-      message,
+      type: `https://api.devflow.local/problems/${status}`,
+      title,
+      status,
+      detail: message,
+      instance: request.url,
       timestamp: new Date().toISOString(),
-      path: request.url,
+      statusCode: status,
     };
 
     if (!isProduction && status >= 500) {
@@ -52,6 +60,6 @@ export class HttpExceptionFilter implements ExceptionFilter {
       this.logger.warn(`${request.method} ${request.url} — ${status}`);
     }
 
-    response.status(status).json(body);
+    response.status(status).type('application/problem+json').json(body);
   }
 }

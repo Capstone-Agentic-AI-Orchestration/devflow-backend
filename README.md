@@ -18,6 +18,7 @@ The current production-ready surface is the project delivery lifecycle around in
 ```powershell
 npm install
 Copy-Item .env.example .env
+docker compose up -d db
 npm run prisma:generate
 npm run prisma:migrate
 npm run build
@@ -86,6 +87,11 @@ GITHUB_ORG=""
 LANGCHAIN_API_KEY=""
 LANGCHAIN_TRACING_V2="false"
 LANGCHAIN_PROJECT="devflow"
+OUTBOX_RELAY_ENABLED="false"
+OUTBOX_RELAY_INTERVAL_MS=10000
+OUTBOX_RELAY_BATCH_SIZE=25
+OUTBOX_RELAY_LOCK_MS=60000
+OUTBOX_RELAY_MAX_ATTEMPTS=5
 ```
 
 `SUPABASE_SERVICE_ROLE_KEY` is server-side only. Never expose it to `devlow-frontend`.
@@ -98,6 +104,10 @@ GitHub delivery requires `GITHUB_APP_ID`, a valid PEM `GITHUB_PRIVATE_KEY`, `GIT
 
 `npm run smoke:orchestration-readiness` is non-destructive and verifies the selected graph LLM provider plus GitHub App delivery credentials without creating a project or repository. It exits successfully while reporting blockers by default; set `ORCHESTRATION_READINESS_STRICT=true` when you want CI to fail on incomplete readiness. `npm run smoke:langgraph-github` is safe by default and skips before creating a repository. Set `LANGGRAPH_GITHUB_SMOKE_CREATE=true` only when you intentionally want a real end-to-end smoke repository created through the full LangGraph Gate 1 -> Gate 2 -> GitHub delivery flow. The destructive live smoke preflights OpenRouter, OpenCode, OpenAI, Anthropic, and Gemini and uses the first configured provider that accepts a real request; set `LANGGRAPH_GITHUB_SMOKE_PROVIDER_AUTO=false` to test only the configured `LLM_PROVIDER`.
 
+`OUTBOX_RELAY_ENABLED=false` keeps integration events durable in Postgres without publishing them. Enable it only for local contract testing until `OUTBOX_PUBLISHER` is replaced with a durable broker-backed publisher.
+
+State-changing intake endpoints accept `Idempotency-Key`. Reusing the same key and same request body returns the stored response; reusing a key with a different body returns `400`; replaying while the first request is still processing returns `409`.
+
 ## Scripts
 
 ```powershell
@@ -105,7 +115,8 @@ npm test              # Vitest unit/regression tests
 npm run build         # Compile NestJS to dist/
 npm run start         # Run compiled output
 npm run start:dev     # Development server
-npm run prisma:migrate
+npm run prisma:migrate      # Apply checked-in SQL migrations
+npm run prisma:migrate:dev  # Create Prisma-authored migrations when needed
 npm run prisma:generate
 npm run prisma:studio
 npm run auth:set-role
@@ -164,6 +175,8 @@ Public:
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `GET` | `/health` | Health probe |
+| `GET` | `/health/live` | Liveness probe |
+| `GET` | `/health/ready` | Readiness probe with database check |
 | `POST` | `/inquiries` | Public project inquiry |
 | `GET` | `/client-invites/status?email=...` | Public invite status lookup |
 
@@ -186,7 +199,7 @@ Authenticated:
 | Client invites | `GET /client-invites/me`, `POST /client-invites/accept` for CLIENT users |
 | Orchestration bridge | `POST /projects/:id/orchestration/start`, status/gate endpoints, mock-provider work-order dispatch |
 
-See `docs/architecture/production-readiness.md` for the role matrix, lifecycle rules, data-integrity rules, and verification baseline.
+See `docs/architecture/production-readiness.md` for the role matrix, lifecycle rules, data-integrity rules, and verification baseline. See `docs/architecture/microservices-readiness.md` for the service boundary map, outbox event contracts, extraction order, and follow-up architecture recommendations.
 
 ## Frontend Pairing
 

@@ -175,18 +175,18 @@ export class RunSupervisorService {
         rb."maxRetries",
         rb."tokensConsumed",
         rb."tokenBudget"
-      FROM "Project" p
-      INNER JOIN run_budgets rb ON rb."projectId" = p.id
+      FROM projects."Project" p
+      INNER JOIN orchestration.run_budgets rb ON rb."projectId" = p.id
       LEFT JOIN LATERAL (
         SELECT MAX(el."occurredAt") AS "lastEventAt"
-        FROM event_logs el
+        FROM orchestration.event_logs el
         WHERE el."projectId" = p.id
       ) last_event ON true
       WHERE p.status IN (
-        CAST(${SUPERVISED_STATUSES[0]} AS "ProjectStatus"),
-        CAST(${SUPERVISED_STATUSES[1]} AS "ProjectStatus"),
-        CAST(${SUPERVISED_STATUSES[2]} AS "ProjectStatus"),
-        CAST(${SUPERVISED_STATUSES[3]} AS "ProjectStatus")
+        CAST(${SUPERVISED_STATUSES[0]} AS projects."ProjectStatus"),
+        CAST(${SUPERVISED_STATUSES[1]} AS projects."ProjectStatus"),
+        CAST(${SUPERVISED_STATUSES[2]} AS projects."ProjectStatus"),
+        CAST(${SUPERVISED_STATUSES[3]} AS projects."ProjectStatus")
       )
         AND (
           last_event."lastEventAt" IS NULL

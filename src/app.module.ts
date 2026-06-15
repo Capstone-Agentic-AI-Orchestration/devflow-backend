@@ -21,6 +21,8 @@ import { AdminModule } from './admin/admin.module';
 import { ScheduleModule as DevFlowScheduleModule } from './schedule/schedule.module';
 import { ReportsModule } from './reports/reports.module';
 import { DevelopersModule } from './developers/developers.module';
+import { SharedKernelModule } from './shared/shared-kernel.module';
+import { HealthModule } from './health/health.module';
 
 @Module({
   imports: [
@@ -32,7 +34,9 @@ import { DevelopersModule } from './developers/developers.module';
     // ScheduleModule must be initialized at the root so all @Interval and
     // @Cron decorators in child modules (SupervisorModule) are picked up.
     ScheduleModule.forRoot(),
+    SharedKernelModule,
     PrismaModule,
+    HealthModule,
     AuthModule,
     GithubModule,
     // Phase 2E — WebSocket gateway (must be before OrchestrationModule so

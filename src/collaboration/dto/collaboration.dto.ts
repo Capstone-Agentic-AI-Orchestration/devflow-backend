@@ -1,4 +1,4 @@
-import { IsBoolean, IsEnum, IsOptional, IsString, IsUrl, MinLength } from 'class-validator';
+import { IsBoolean, IsEnum, IsInt, IsOptional, IsString, IsUrl, Min, MinLength } from 'class-validator';
 import {
   CollaborationDocumentKind,
   CollaborationDocumentStatus,
@@ -98,6 +98,11 @@ export class UpdateCollaborationDocumentDto {
   @IsOptional()
   @IsBoolean()
   clientVisible?: boolean;
+
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  version?: number;
 }
 
 export class ReviewCollaborationDocumentDto {
@@ -107,4 +112,9 @@ export class ReviewCollaborationDocumentDto {
   @IsOptional()
   @IsString()
   reviewNote?: string;
+
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  version?: number;
 }

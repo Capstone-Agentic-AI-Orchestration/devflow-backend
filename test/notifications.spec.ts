@@ -2,8 +2,11 @@ import { describe, expect, it, beforeEach, vi } from 'vitest';
 import { NotFoundException } from '@nestjs/common';
 import { NotificationType, UserRole } from '@prisma/client';
 import { NotificationsService } from '../src/notifications/notifications.service';
+import { NotificationsRepository } from '../src/notifications/notifications.repository';
 import { PrismaService } from '../src/prisma/prisma.service';
 import { AuthUser } from '../src/auth/auth.types';
+import { IntegrationEvents } from '../src/shared/events/integration-event';
+import { OutboxService } from '../src/shared/events/outbox.service';
 
 const devUser: AuthUser = {
   id: '33333333-3333-4333-8333-333333333333',
@@ -39,6 +42,9 @@ function makePrismaMock() {
     projectTimelineEvent: {
       create: vi.fn().mockResolvedValue({ id: 'timeline-1' }),
     },
+    integrationOutbox: {
+      create: vi.fn().mockResolvedValue({ id: 'outbox-1' }),
+    },
   };
 }
 
@@ -48,7 +54,11 @@ describe('NotificationsService', () => {
 
   beforeEach(() => {
     prisma = makePrismaMock();
-    service = new NotificationsService(prisma as unknown as PrismaService);
+    const repository = new NotificationsRepository(prisma as unknown as PrismaService);
+    service = new NotificationsService(
+      repository,
+      new OutboxService(prisma as unknown as PrismaService),
+    );
   });
 
   it('list returns only notifications for the current user', async () => {
@@ -59,6 +69,33 @@ describe('NotificationsService', () => {
       include: expect.any(Object),
       orderBy: { createdAt: 'desc' },
       take: 50,
+    });
+  });
+
+  it('list returns a cursor page when pagination is requested', async () => {
+    prisma.notification.findMany.mockResolvedValue([
+      { id: 'notification-2', recipientId: devUser.id },
+      { id: 'notification-3', recipientId: devUser.id },
+      { id: 'notification-4', recipientId: devUser.id },
+    ]);
+
+    await expect(
+      service.list(devUser, { limit: '2', cursor: 'notification-1' }),
+    ).resolves.toEqual({
+      items: [
+        { id: 'notification-2', recipientId: devUser.id },
+        { id: 'notification-3', recipientId: devUser.id },
+      ],
+      nextCursor: 'notification-4',
+    });
+
+    expect(prisma.notification.findMany).toHaveBeenCalledWith({
+      where: { recipientId: devUser.id },
+      include: expect.any(Object),
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      take: 3,
+      cursor: { id: 'notification-1' },
+      skip: 1,
     });
   });
 
@@ -95,6 +132,13 @@ describe('NotificationsService', () => {
       ],
       skipDuplicates: false,
     });
+    expect(prisma.integrationOutbox.create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({
+        eventType: IntegrationEvents.notificationRequested,
+        aggregateType: 'notification',
+        producer: 'notifications',
+      }),
+    }));
   });
 
   it('markAllRead marks unread notifications for the current user', async () => {

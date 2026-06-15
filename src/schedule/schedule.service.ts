@@ -2,22 +2,37 @@ import { BadRequestException, Injectable, NotFoundException } from '@nestjs/comm
 import { Prisma, ScheduleVisibility, UserRole } from '@prisma/client';
 import { AuthUser } from '../auth/auth.types';
 import { PrismaService } from '../prisma/prisma.service';
+import {
+  CursorPageInput,
+  cursorQueryArgs,
+  hasCursorPage,
+  toCursorPage,
+} from '../shared/pagination/cursor-pagination';
 import { CreateScheduleEventDto, UpdateScheduleEventDto } from './dto/schedule.dto';
 
 @Injectable()
 export class ScheduleService {
   constructor(private readonly prisma: PrismaService) {}
 
-  list(user: AuthUser) {
-    return this.prisma.scheduleEvent.findMany({
+  async list(user: AuthUser, page?: CursorPageInput) {
+    const paged = hasCursorPage(page);
+    const events = await this.prisma.scheduleEvent.findMany({
       where: this.accessWhere(user),
       include: {
         project: { select: { id: true, companyName: true, status: true } },
         owner: { select: { id: true, email: true, fullName: true, role: true } },
       },
-      orderBy: [{ startsAt: 'asc' }, { createdAt: 'asc' }],
-      take: 250,
+      orderBy: paged
+        ? [{ startsAt: 'asc' }, { createdAt: 'asc' }, { id: 'asc' }]
+        : [{ startsAt: 'asc' }, { createdAt: 'asc' }],
+      ...(paged ? cursorQueryArgs(page) : { take: 250 }),
     });
+
+    if (paged) {
+      return toCursorPage(events, page);
+    }
+
+    return events;
   }
 
   async create(user: AuthUser, dto: CreateScheduleEventDto) {

@@ -13,10 +13,8 @@ CREATE TABLE "profiles" (
 
 CREATE UNIQUE INDEX "profiles_email_key" ON "profiles"("email");
 
-ALTER TABLE "profiles"
-  ADD CONSTRAINT "profiles_id_fkey"
-  FOREIGN KEY ("id") REFERENCES auth.users("id")
-  ON DELETE CASCADE ON UPDATE CASCADE;
+COMMENT ON TABLE "profiles" IS
+  'Application-owned identity profile. id stores the upstream Supabase Auth user UUID, but profiles intentionally do not FK into auth.users so Prisma migrations stay schema-local and the identity boundary can be extracted independently.';
 
 ALTER TABLE "Project"
   ADD COLUMN "createdById" UUID;

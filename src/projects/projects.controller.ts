@@ -3,11 +3,13 @@ import {
   Controller,
   Delete,
   Get,
+  Headers,
   HttpCode,
   HttpStatus,
   Param,
   Patch,
   Post,
+  Query,
   Res,
   UseGuards,
   UsePipes,
@@ -34,24 +36,57 @@ import { AuthUser } from '../auth/auth.types';
 import { Roles } from '../auth/roles.decorator';
 import { RolesGuard } from '../auth/roles.guard';
 import { SupabaseAuthGuard } from '../auth/supabase-auth.guard';
+import { executeIdempotentCommand } from '../shared/idempotency/idempotent-command';
+import { IdempotencyService } from '../shared/idempotency/idempotency.service';
+import { CursorPageInput } from '../shared/pagination/cursor-pagination';
 
 @Controller('projects')
 @UseGuards(SupabaseAuthGuard, RolesGuard)
 export class ProjectsController {
-  constructor(private readonly projectsService: ProjectsService) {}
+  constructor(
+    private readonly projectsService: ProjectsService,
+    private readonly idempotency: IdempotencyService,
+  ) {}
+
+  private runIdempotent<TBody>(
+    idempotencyKey: string | undefined,
+    scope: string,
+    requestPayload: unknown,
+    responseStatus: number,
+    handler: () => Promise<TBody>,
+  ): Promise<TBody> {
+    return executeIdempotentCommand({
+      idempotency: this.idempotency,
+      idempotencyKey,
+      scope,
+      requestPayload,
+      responseStatus,
+      handler,
+    });
+  }
 
   @Post()
   @Roles(UserRole.PM, UserRole.ADMIN)
   @HttpCode(HttpStatus.CREATED)
   @UsePipes(new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true }))
-  create(@Body() dto: CreateProjectDto, @CurrentUser() user: AuthUser) {
-    return this.projectsService.create(dto, user);
+  create(
+    @Body() dto: CreateProjectDto,
+    @CurrentUser() user: AuthUser,
+    @Headers('idempotency-key') idempotencyKey?: string,
+  ) {
+    return this.runIdempotent(
+      idempotencyKey,
+      `user:${user.id}:POST:/projects`,
+      dto,
+      HttpStatus.CREATED,
+      () => this.projectsService.create(dto, user),
+    );
   }
 
   @Get()
   @Roles(UserRole.CLIENT, UserRole.PM, UserRole.DEV, UserRole.ADMIN)
-  findAll(@CurrentUser() user: AuthUser) {
-    return this.projectsService.findAll(user);
+  findAll(@CurrentUser() user: AuthUser, @Query() page?: CursorPageInput) {
+    return this.projectsService.findAll(user, page);
   }
 
   @Get('details')
@@ -73,8 +108,15 @@ export class ProjectsController {
     @Param('id') id: string,
     @Body() dto: UpdateProjectDto,
     @CurrentUser() user: AuthUser,
+    @Headers('idempotency-key') idempotencyKey?: string,
   ) {
-    return this.projectsService.update(id, user, dto);
+    return this.runIdempotent(
+      idempotencyKey,
+      `user:${user.id}:PATCH:/projects/${id}`,
+      dto,
+      HttpStatus.OK,
+      () => this.projectsService.update(id, user, dto),
+    );
   }
 
   @Post(':id/members')
@@ -84,8 +126,15 @@ export class ProjectsController {
     @Param('id') id: string,
     @Body() dto: AddProjectMemberDto,
     @CurrentUser() user: AuthUser,
+    @Headers('idempotency-key') idempotencyKey?: string,
   ) {
-    return this.projectsService.addMember(id, user, dto);
+    return this.runIdempotent(
+      idempotencyKey,
+      `user:${user.id}:POST:/projects/${id}/members`,
+      dto,
+      HttpStatus.CREATED,
+      () => this.projectsService.addMember(id, user, dto),
+    );
   }
 
   @Delete(':id/members/:userId')
@@ -94,14 +143,25 @@ export class ProjectsController {
     @Param('id') id: string,
     @Param('userId') userId: string,
     @CurrentUser() user: AuthUser,
+    @Headers('idempotency-key') idempotencyKey?: string,
   ) {
-    return this.projectsService.removeMember(id, userId, user);
+    return this.runIdempotent(
+      idempotencyKey,
+      `user:${user.id}:DELETE:/projects/${id}/members/${userId}`,
+      { userId },
+      HttpStatus.OK,
+      () => this.projectsService.removeMember(id, userId, user),
+    );
   }
 
   @Get(':id/artifacts')
   @Roles(UserRole.CLIENT, UserRole.PM, UserRole.DEV, UserRole.ADMIN)
-  findArtifacts(@Param('id') id: string, @CurrentUser() user: AuthUser) {
-    return this.projectsService.findArtifacts(id, user);
+  findArtifacts(
+    @Param('id') id: string,
+    @CurrentUser() user: AuthUser,
+    @Query() page?: CursorPageInput,
+  ) {
+    return this.projectsService.findArtifacts(id, user, page);
   }
 
   @Get(':id/artifacts/:artifactId')
@@ -136,8 +196,15 @@ export class ProjectsController {
     @Param('artifactId') artifactId: string,
     @Body() dto: ShareArtifactDto,
     @CurrentUser() user: AuthUser,
+    @Headers('idempotency-key') idempotencyKey?: string,
   ) {
-    return this.projectsService.updateArtifactSharing(id, artifactId, user, dto);
+    return this.runIdempotent(
+      idempotencyKey,
+      `user:${user.id}:PATCH:/projects/${id}/artifacts/${artifactId}/share`,
+      dto,
+      HttpStatus.OK,
+      () => this.projectsService.updateArtifactSharing(id, artifactId, user, dto),
+    );
   }
 
   @Post(':id/artifacts/:artifactId/review')
@@ -148,8 +215,15 @@ export class ProjectsController {
     @Param('artifactId') artifactId: string,
     @Body() dto: ReviewArtifactDto,
     @CurrentUser() user: AuthUser,
+    @Headers('idempotency-key') idempotencyKey?: string,
   ) {
-    return this.projectsService.reviewArtifact(id, artifactId, user, dto);
+    return this.runIdempotent(
+      idempotencyKey,
+      `user:${user.id}:POST:/projects/${id}/artifacts/${artifactId}/review`,
+      dto,
+      HttpStatus.OK,
+      () => this.projectsService.reviewArtifact(id, artifactId, user, dto),
+    );
   }
 
   @Patch(':id/artifacts/:artifactId/revision')
@@ -160,8 +234,15 @@ export class ProjectsController {
     @Param('artifactId') artifactId: string,
     @Body() dto: HandleRevisionDto,
     @CurrentUser() user: AuthUser,
+    @Headers('idempotency-key') idempotencyKey?: string,
   ) {
-    return this.projectsService.handleRevision(id, artifactId, user, dto);
+    return this.runIdempotent(
+      idempotencyKey,
+      `user:${user.id}:PATCH:/projects/${id}/artifacts/${artifactId}/revision`,
+      dto,
+      HttpStatus.OK,
+      () => this.projectsService.handleRevision(id, artifactId, user, dto),
+    );
   }
 
   @Patch(':id/artifacts/:artifactId/output-review')
@@ -172,8 +253,15 @@ export class ProjectsController {
     @Param('artifactId') artifactId: string,
     @Body() dto: ReviewArtifactOutputDto,
     @CurrentUser() user: AuthUser,
+    @Headers('idempotency-key') idempotencyKey?: string,
   ) {
-    return this.projectsService.reviewArtifactOutput(id, artifactId, user, dto);
+    return this.runIdempotent(
+      idempotencyKey,
+      `user:${user.id}:PATCH:/projects/${id}/artifacts/${artifactId}/output-review`,
+      dto,
+      HttpStatus.OK,
+      () => this.projectsService.reviewArtifactOutput(id, artifactId, user, dto),
+    );
   }
 
   @Post(':id/artifacts/:artifactId/publish')
@@ -185,8 +273,15 @@ export class ProjectsController {
     @Param('artifactId') artifactId: string,
     @Body() dto: PublishArtifactOutputDto,
     @CurrentUser() user: AuthUser,
+    @Headers('idempotency-key') idempotencyKey?: string,
   ) {
-    return this.projectsService.publishArtifactOutput(id, artifactId, user, dto);
+    return this.runIdempotent(
+      idempotencyKey,
+      `user:${user.id}:POST:/projects/${id}/artifacts/${artifactId}/publish`,
+      dto,
+      HttpStatus.OK,
+      () => this.projectsService.publishArtifactOutput(id, artifactId, user, dto),
+    );
   }
 
   @Get(':id/delivery-review')
@@ -209,8 +304,15 @@ export class ProjectsController {
     @Param('id') id: string,
     @Body() dto: ProjectDeliveryReviewNoteDto,
     @CurrentUser() user: AuthUser,
+    @Headers('idempotency-key') idempotencyKey?: string,
   ) {
-    return this.projectsService.acceptDelivery(id, user, dto);
+    return this.runIdempotent(
+      idempotencyKey,
+      `user:${user.id}:POST:/projects/${id}/delivery-review/accept`,
+      dto,
+      HttpStatus.CREATED,
+      () => this.projectsService.acceptDelivery(id, user, dto),
+    );
   }
 
   @Post(':id/delivery-review/revision')
@@ -221,8 +323,15 @@ export class ProjectsController {
     @Param('id') id: string,
     @Body() dto: ProjectDeliveryReviewNoteDto,
     @CurrentUser() user: AuthUser,
+    @Headers('idempotency-key') idempotencyKey?: string,
   ) {
-    return this.projectsService.requestDeliveryRevision(id, user, dto);
+    return this.runIdempotent(
+      idempotencyKey,
+      `user:${user.id}:POST:/projects/${id}/delivery-review/revision`,
+      dto,
+      HttpStatus.CREATED,
+      () => this.projectsService.requestDeliveryRevision(id, user, dto),
+    );
   }
 
   @Patch(':id/delivery-review/resolve')
@@ -232,14 +341,25 @@ export class ProjectsController {
     @Param('id') id: string,
     @Body() dto: ProjectDeliveryReviewNoteDto,
     @CurrentUser() user: AuthUser,
+    @Headers('idempotency-key') idempotencyKey?: string,
   ) {
-    return this.projectsService.resolveDeliveryRevision(id, user, dto);
+    return this.runIdempotent(
+      idempotencyKey,
+      `user:${user.id}:PATCH:/projects/${id}/delivery-review/resolve`,
+      dto,
+      HttpStatus.OK,
+      () => this.projectsService.resolveDeliveryRevision(id, user, dto),
+    );
   }
 
   @Get(':id/tasks')
   @Roles(UserRole.PM, UserRole.DEV, UserRole.ADMIN)
-  findTasks(@Param('id') id: string, @CurrentUser() user: AuthUser) {
-    return this.projectsService.findTasks(id, user);
+  findTasks(
+    @Param('id') id: string,
+    @CurrentUser() user: AuthUser,
+    @Query() page?: CursorPageInput,
+  ) {
+    return this.projectsService.findTasks(id, user, page);
   }
 
   @Get(':id/kickoff')
@@ -255,22 +375,49 @@ export class ProjectsController {
     @Param('id') id: string,
     @Body() dto: UpdateProjectKickoffDto,
     @CurrentUser() user: AuthUser,
+    @Headers('idempotency-key') idempotencyKey?: string,
   ) {
-    return this.projectsService.updateKickoff(id, user, dto);
+    return this.runIdempotent(
+      idempotencyKey,
+      `user:${user.id}:PATCH:/projects/${id}/kickoff`,
+      dto,
+      HttpStatus.OK,
+      () => this.projectsService.updateKickoff(id, user, dto),
+    );
   }
 
   @Post(':id/kickoff/tasks')
   @Roles(UserRole.PM, UserRole.ADMIN)
   @HttpCode(HttpStatus.CREATED)
-  createKickoffTasks(@Param('id') id: string, @CurrentUser() user: AuthUser) {
-    return this.projectsService.createKickoffTasks(id, user);
+  createKickoffTasks(
+    @Param('id') id: string,
+    @CurrentUser() user: AuthUser,
+    @Headers('idempotency-key') idempotencyKey?: string,
+  ) {
+    return this.runIdempotent(
+      idempotencyKey,
+      `user:${user.id}:POST:/projects/${id}/kickoff/tasks`,
+      {},
+      HttpStatus.CREATED,
+      () => this.projectsService.createKickoffTasks(id, user),
+    );
   }
 
   @Post(':id/kickoff/work-orders')
   @Roles(UserRole.PM, UserRole.ADMIN)
   @HttpCode(HttpStatus.CREATED)
-  createKickoffWorkOrders(@Param('id') id: string, @CurrentUser() user: AuthUser) {
-    return this.projectsService.createKickoffWorkOrders(id, user);
+  createKickoffWorkOrders(
+    @Param('id') id: string,
+    @CurrentUser() user: AuthUser,
+    @Headers('idempotency-key') idempotencyKey?: string,
+  ) {
+    return this.runIdempotent(
+      idempotencyKey,
+      `user:${user.id}:POST:/projects/${id}/kickoff/work-orders`,
+      {},
+      HttpStatus.CREATED,
+      () => this.projectsService.createKickoffWorkOrders(id, user),
+    );
   }
 
   @Post(':id/tasks')
@@ -280,8 +427,15 @@ export class ProjectsController {
     @Param('id') id: string,
     @Body() dto: CreateProjectTaskDto,
     @CurrentUser() user: AuthUser,
+    @Headers('idempotency-key') idempotencyKey?: string,
   ) {
-    return this.projectsService.createTask(id, user, dto);
+    return this.runIdempotent(
+      idempotencyKey,
+      `user:${user.id}:POST:/projects/${id}/tasks`,
+      dto,
+      HttpStatus.CREATED,
+      () => this.projectsService.createTask(id, user, dto),
+    );
   }
 
   @Patch(':id/tasks/:taskId')
@@ -292,8 +446,15 @@ export class ProjectsController {
     @Param('taskId') taskId: string,
     @Body() dto: UpdateProjectTaskDto,
     @CurrentUser() user: AuthUser,
+    @Headers('idempotency-key') idempotencyKey?: string,
   ) {
-    return this.projectsService.updateTask(id, taskId, user, dto);
+    return this.runIdempotent(
+      idempotencyKey,
+      `user:${user.id}:PATCH:/projects/${id}/tasks/${taskId}`,
+      dto,
+      HttpStatus.OK,
+      () => this.projectsService.updateTask(id, taskId, user, dto),
+    );
   }
 
   @Get(':id/tasks/:taskId/activity')
@@ -302,8 +463,9 @@ export class ProjectsController {
     @Param('id') id: string,
     @Param('taskId') taskId: string,
     @CurrentUser() user: AuthUser,
+    @Query() page?: CursorPageInput,
   ) {
-    return this.projectsService.findTaskActivity(id, taskId, user);
+    return this.projectsService.findTaskActivity(id, taskId, user, page);
   }
 
   @Post(':id/tasks/:taskId/comments')
@@ -314,14 +476,25 @@ export class ProjectsController {
     @Param('taskId') taskId: string,
     @Body() dto: AddTaskCommentDto,
     @CurrentUser() user: AuthUser,
+    @Headers('idempotency-key') idempotencyKey?: string,
   ) {
-    return this.projectsService.addTaskComment(id, taskId, user, dto);
+    return this.runIdempotent(
+      idempotencyKey,
+      `user:${user.id}:POST:/projects/${id}/tasks/${taskId}/comments`,
+      dto,
+      HttpStatus.CREATED,
+      () => this.projectsService.addTaskComment(id, taskId, user, dto),
+    );
   }
 
   @Get(':id/work-orders')
   @Roles(UserRole.PM, UserRole.DEV, UserRole.ADMIN)
-  findWorkOrders(@Param('id') id: string, @CurrentUser() user: AuthUser) {
-    return this.projectsService.findWorkOrders(id, user);
+  findWorkOrders(
+    @Param('id') id: string,
+    @CurrentUser() user: AuthUser,
+    @Query() page?: CursorPageInput,
+  ) {
+    return this.projectsService.findWorkOrders(id, user, page);
   }
 
   @Post(':id/work-orders')
@@ -331,8 +504,15 @@ export class ProjectsController {
     @Param('id') id: string,
     @Body() dto: CreateWorkOrderDto,
     @CurrentUser() user: AuthUser,
+    @Headers('idempotency-key') idempotencyKey?: string,
   ) {
-    return this.projectsService.createWorkOrder(id, user, dto);
+    return this.runIdempotent(
+      idempotencyKey,
+      `user:${user.id}:POST:/projects/${id}/work-orders`,
+      dto,
+      HttpStatus.CREATED,
+      () => this.projectsService.createWorkOrder(id, user, dto),
+    );
   }
 
   @Patch(':id/work-orders/:workOrderId')
@@ -343,8 +523,15 @@ export class ProjectsController {
     @Param('workOrderId') workOrderId: string,
     @Body() dto: UpdateWorkOrderDto,
     @CurrentUser() user: AuthUser,
+    @Headers('idempotency-key') idempotencyKey?: string,
   ) {
-    return this.projectsService.updateWorkOrder(id, workOrderId, user, dto);
+    return this.runIdempotent(
+      idempotencyKey,
+      `user:${user.id}:PATCH:/projects/${id}/work-orders/${workOrderId}`,
+      dto,
+      HttpStatus.OK,
+      () => this.projectsService.updateWorkOrder(id, workOrderId, user, dto),
+    );
   }
 
   @Post(':id/work-orders/:workOrderId/dispatch')
@@ -354,8 +541,15 @@ export class ProjectsController {
     @Param('id') id: string,
     @Param('workOrderId') workOrderId: string,
     @CurrentUser() user: AuthUser,
+    @Headers('idempotency-key') idempotencyKey?: string,
   ) {
-    return this.projectsService.dispatchWorkOrder(id, workOrderId, user);
+    return this.runIdempotent(
+      idempotencyKey,
+      `user:${user.id}:POST:/projects/${id}/work-orders/${workOrderId}/dispatch`,
+      {},
+      HttpStatus.ACCEPTED,
+      () => this.projectsService.dispatchWorkOrder(id, workOrderId, user),
+    );
   }
 
   @Post(':id/work-orders/:workOrderId/retry')
@@ -365,20 +559,35 @@ export class ProjectsController {
     @Param('id') id: string,
     @Param('workOrderId') workOrderId: string,
     @CurrentUser() user: AuthUser,
+    @Headers('idempotency-key') idempotencyKey?: string,
   ) {
-    return this.projectsService.retryFailedWorkOrder(id, workOrderId, user);
+    return this.runIdempotent(
+      idempotencyKey,
+      `user:${user.id}:POST:/projects/${id}/work-orders/${workOrderId}/retry`,
+      {},
+      HttpStatus.ACCEPTED,
+      () => this.projectsService.retryFailedWorkOrder(id, workOrderId, user),
+    );
   }
 
   @Get(':id/events')
   @Roles(UserRole.PM, UserRole.DEV, UserRole.ADMIN)
-  findEvents(@Param('id') id: string, @CurrentUser() user: AuthUser) {
-    return this.projectsService.findEvents(id, user);
+  findEvents(
+    @Param('id') id: string,
+    @CurrentUser() user: AuthUser,
+    @Query() page?: CursorPageInput,
+  ) {
+    return this.projectsService.findEvents(id, user, page);
   }
 
   @Get(':id/timeline')
   @Roles(UserRole.CLIENT, UserRole.PM, UserRole.DEV, UserRole.ADMIN)
-  findTimeline(@Param('id') id: string, @CurrentUser() user: AuthUser) {
-    return this.projectsService.findTimeline(id, user);
+  findTimeline(
+    @Param('id') id: string,
+    @CurrentUser() user: AuthUser,
+    @Query() page?: CursorPageInput,
+  ) {
+    return this.projectsService.findTimeline(id, user, page);
   }
 
   @Post(':id/orchestration/start')
@@ -445,8 +654,15 @@ export class ProjectsController {
     @Param('id') id: string,
     @Body() dto: ApproveGateDto,
     @CurrentUser() user: AuthUser,
+    @Headers('idempotency-key') idempotencyKey?: string,
   ) {
-    return this.projectsService.approveGate1(id, user, dto.approved, dto.notes);
+    return this.runIdempotent(
+      idempotencyKey,
+      `user:${user.id}:POST:/projects/${id}/gates/architecture`,
+      dto,
+      HttpStatus.OK,
+      () => this.projectsService.approveGate1(id, user, dto.approved, dto.notes),
+    );
   }
 
   @Post(':id/gates/code')
@@ -457,8 +673,15 @@ export class ProjectsController {
     @Param('id') id: string,
     @Body() dto: ApproveGateDto,
     @CurrentUser() user: AuthUser,
+    @Headers('idempotency-key') idempotencyKey?: string,
   ) {
-    return this.projectsService.approveGate2(id, user, dto.approved, dto.notes);
+    return this.runIdempotent(
+      idempotencyKey,
+      `user:${user.id}:POST:/projects/${id}/gates/code`,
+      dto,
+      HttpStatus.OK,
+      () => this.projectsService.approveGate2(id, user, dto.approved, dto.notes),
+    );
   }
 
   @Get(':id/status')
