@@ -13,6 +13,7 @@ export class SupabaseAuthService implements OnModuleInit {
   private readonly jwks: ReturnType<typeof createRemoteJWKSet>;
   private jwksWarmed = false;
   private readonly lastInviteCheck = new Map<string, number>();
+  private readonly allowedProviders: Set<string>;
 
   constructor(
     private readonly configService: ConfigService,
@@ -27,6 +28,11 @@ export class SupabaseAuthService implements OnModuleInit {
     this.issuer = `${normalizedUrl}/auth/v1`;
     this.jwks = createRemoteJWKSet(
       new URL(`${this.issuer}/.well-known/jwks.json`),
+    );
+    this.allowedProviders = new Set(
+      (this.configService.get<string[]>('auth.allowedProviders') ?? ['github'])
+        .map((provider) => provider.trim().toLowerCase())
+        .filter(Boolean),
     );
   }
 
@@ -56,8 +62,12 @@ export class SupabaseAuthService implements OnModuleInit {
         audience: 'authenticated',
       });
 
+      this.assertAllowedProvider(payload);
       return this.syncProfile(payload);
-    } catch {
+    } catch (error) {
+      if (error instanceof UnauthorizedException) {
+        throw error;
+      }
       throw new UnauthorizedException('Invalid or expired access token');
     }
   }
@@ -70,6 +80,7 @@ export class SupabaseAuthService implements OnModuleInit {
 
     const email = this.getEmail(payload);
     const fullName = this.getFullName(payload);
+    const authProvider = this.getAuthProvider(payload);
 
     const existing = await this.prisma.profile.findUnique({
       where: { id: userId },
@@ -110,7 +121,7 @@ export class SupabaseAuthService implements OnModuleInit {
       this.lastInviteCheck.set(userId, Date.now());
     }
 
-    return profile;
+    return { ...profile, authProvider };
   }
 
   private getEmail(payload: JWTPayload): string | null {
@@ -124,9 +135,50 @@ export class SupabaseAuthService implements OnModuleInit {
     }
 
     const fullName = (metadata as Record<string, unknown>).full_name;
-    return typeof fullName === 'string' && fullName.trim()
-      ? fullName.trim()
+    const name = (metadata as Record<string, unknown>).name;
+    const userName = (metadata as Record<string, unknown>).user_name;
+    const candidate = [fullName, name, userName].find(
+      (value) => typeof value === 'string' && value.trim(),
+    );
+    return typeof candidate === 'string'
+      ? candidate.trim()
       : null;
+  }
+
+  private assertAllowedProvider(payload: JWTPayload): void {
+    if (this.allowedProviders.has('*')) return;
+
+    const providers = this.getAuthProviders(payload);
+    if (providers.some((provider) => this.allowedProviders.has(provider))) {
+      return;
+    }
+
+    throw new UnauthorizedException(
+      `Sign in with ${Array.from(this.allowedProviders).join(' or ')} to access DevFlow`,
+    );
+  }
+
+  private getAuthProvider(payload: JWTPayload): string | null {
+    return this.getAuthProviders(payload)[0] ?? null;
+  }
+
+  private getAuthProviders(payload: JWTPayload): string[] {
+    const appMetadata = payload.app_metadata;
+    if (!appMetadata || typeof appMetadata !== 'object' || Array.isArray(appMetadata)) {
+      return [];
+    }
+
+    const metadata = appMetadata as Record<string, unknown>;
+    const providers = metadata.providers;
+    const provider = metadata.provider;
+
+    if (Array.isArray(providers)) {
+      return providers
+        .filter((value): value is string => typeof value === 'string')
+        .map((value) => value.toLowerCase());
+    }
+
+    return typeof provider === 'string' ? [provider.toLowerCase()] : [];
   }
 
   private async acceptPendingClientInvites(profile: AuthUser): Promise<void> {

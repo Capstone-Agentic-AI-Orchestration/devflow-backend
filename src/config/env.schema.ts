@@ -3,6 +3,7 @@ import { z } from 'zod';
 export const envSchema = z.object({
   DATABASE_URL: z.string().url('DATABASE_URL must be a valid URL'),
   SUPABASE_URL: z.string().url('SUPABASE_URL must be a valid URL'),
+  AUTH_ALLOWED_PROVIDERS: z.string().optional().default('github'),
   AGENT_PROVIDER: z.enum(['mock', 'llm']).optional().default('mock'),
   LLM_PROVIDER: z.enum(['openrouter', 'openai', 'anthropic', 'opencode', 'gemini']).optional().default('openrouter'),
   LLM_REQUEST_TIMEOUT_MS: z

@@ -71,6 +71,12 @@ export default () => {
     supabase: {
       url: env.data.SUPABASE_URL,
     },
+    auth: {
+      allowedProviders: env.data.AUTH_ALLOWED_PROVIDERS
+        .split(',')
+        .map((provider) => provider.trim().toLowerCase())
+        .filter(Boolean),
+    },
     anthropic: {
       apiKey: env.data.ANTHROPIC_API_KEY,
     },

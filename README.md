@@ -79,6 +79,7 @@ NODE_ENV="development"
 CORS_ORIGIN="http://localhost:3000"
 SUPABASE_SERVICE_ROLE_KEY=""
 SUPABASE_ANON_KEY=""
+AUTH_ALLOWED_PROVIDERS="github"
 # Alternate provider keys. The LangGraph and work-order agents use OpenRouter by default.
 GITHUB_APP_ID=""
 GITHUB_PRIVATE_KEY=""
@@ -95,6 +96,8 @@ OUTBOX_RELAY_MAX_ATTEMPTS=5
 ```
 
 `SUPABASE_SERVICE_ROLE_KEY` is server-side only. Never expose it to `devlow-frontend`.
+
+DevFlow login uses Supabase Auth. For the current GitHub OAuth-only rollout, configure GitHub as a Supabase Auth provider and keep `AUTH_ALLOWED_PROVIDERS="github"` on Render. When Google is enabled later, set `AUTH_ALLOWED_PROVIDERS="github,google"`. See `docs/setup/github-oauth-render-vercel.md` for the full Supabase, Render, and Vercel setup.
 
 `AGENT_PROVIDER=mock` runs the deterministic local orchestration provider and does not require LLM or GitHub credentials. Use `AGENT_PROVIDER=llm` with `LLM_PROVIDER=openrouter` and `OPENROUTER_API_KEY` to run real LangGraph and work-order artifact generation through OpenRouter. If OpenRouter is throttled, `LLM_PROVIDER=opencode` with `OPENCODE_API_KEY`, `LLM_PROVIDER=openai` with `OPENAI_API_KEY`, `LLM_PROVIDER=anthropic` with `ANTHROPIC_API_KEY`, or `LLM_PROVIDER=gemini` with `GEMINI_API_KEY` uses an alternate provider instead. The default OpenRouter model is `deepseek/deepseek-v4-flash:free`; the default OpenCode model is `deepseek-v4-flash`; the default OpenAI model is `gpt-4.1-mini`; the default Anthropic model is `claude-3-5-haiku-20241022`; the default Gemini model is `gemini-3.5-flash`. `LLM_REQUEST_TIMEOUT_MS` and `LLM_CONCURRENCY_LIMIT` apply across graph and work-order model calls.
 
