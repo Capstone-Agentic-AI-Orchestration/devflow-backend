@@ -9,7 +9,17 @@ export function normalizeGithubPrivateKey(value: string | undefined): string | u
   const rawPem = trimmed.replace(/\\n/g, '\n').trim();
   if (rawPem.includes('-----BEGIN')) return rawPem;
 
-  const decodedPem = Buffer.from(trimmed, 'base64')
+  const der = Buffer.from(trimmed, 'base64');
+
+  // If the decoded bytes look like a PKCS#1 DER key (starts with 0x30 SEQUENCE),
+  // wrap in PEM headers. Otherwise treat as plain text (e.g. raw PEM with \n escaped).
+  if (der.length > 0 && der[0] === 0x30) {
+    const b64 = der.toString('base64');
+    const lines = b64.match(/.{1,64}/g)?.join('\n') ?? b64;
+    return `-----BEGIN RSA PRIVATE KEY-----\n${lines}\n-----END RSA PRIVATE KEY-----`;
+  }
+
+  const decodedPem = der
     .toString('utf-8')
     .trim()
     .replace(/\\n/g, '\n')

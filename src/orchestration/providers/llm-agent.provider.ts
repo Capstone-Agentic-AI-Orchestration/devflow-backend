@@ -386,7 +386,6 @@ export class LlmAgentProvider implements WorkOrderAgentProvider {
   private responseFormat(name: string): Record<string, unknown> {
     if (
       this.providerName() === 'openai' ||
-      this.providerName() === 'opencode' ||
       this.providerName() === 'gemini'
     ) {
       return {

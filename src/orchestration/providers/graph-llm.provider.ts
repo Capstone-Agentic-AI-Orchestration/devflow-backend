@@ -410,7 +410,6 @@ export class GraphLlmProvider {
   private responseFormat(options: GraphLlmJsonOptions): Record<string, unknown> {
     if (
       this.providerName() === 'openai' ||
-      this.providerName() === 'opencode' ||
       this.providerName() === 'gemini'
     ) {
       return {
