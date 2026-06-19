@@ -7,6 +7,7 @@ export interface AuthUser {
   fullName: string | null;
   role: UserRole;
   status?: ProfileStatus;
+  authProvider?: string | null;
 }
 
 export interface AuthenticatedRequest extends Request {
