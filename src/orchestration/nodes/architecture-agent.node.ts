@@ -3,6 +3,9 @@ import { DevFlowStateType, GeneratedArtifact } from '../graph/devflow.state';
 import { MemoryService } from '../../memory/memory.service';
 import { EventLogService } from '../../supervisor/event-log.service';
 import { GraphLlmProvider } from '../providers/graph-llm.provider';
+import { PrismaService } from '../../prisma/prisma.service';
+import { StreamEmitter } from '../streaming/stream-emitter.service';
+import { humanReadableError } from './human-readable-error';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -18,22 +21,28 @@ export class ArchitectureAgentNode {
   private readonly logger = new Logger(ArchitectureAgentNode.name);
 
   constructor(
+    private readonly prisma: PrismaService,
     private readonly memory: MemoryService,
     private readonly eventLog: EventLogService,
     private readonly graphLlm: GraphLlmProvider,
+    private readonly streamEmitter: StreamEmitter,
   ) {}
 
   async execute(
     state: DevFlowStateType,
   ): Promise<Partial<DevFlowStateType>> {
-    this.logger.log(`[${state.projectId}] Architecture agent generating docs`);
+    const { projectId, runId } = state;
+    this.logger.log(`[${projectId}] Architecture agent generating docs`);
 
     if (!state.contract) {
+      this.streamEmitter.emit(projectId, 'architecture_agent', runId ?? '', 'error', 'Architecture agent skipped: contract is missing');
       return { error: 'ArchitectureAgentNode: contract is null' };
     }
 
     // Log STARTED — allSettled inside, so failure here does not block the node.
-    await this.eventLog.logStarted(state.projectId, 'architecture_agent');
+    await this.eventLog.logStarted(projectId, 'architecture_agent');
+
+    this.streamEmitter.emit(projectId, 'architecture_agent', runId ?? '', 'decision', 'Starting architecture documentation generation...');
 
     try {
       // ── 1. Read relevant memories ──────────────────────────────────────────
@@ -54,6 +63,9 @@ export class ArchitectureAgentNode {
         query: memoryQuery,
       });
       const memoryContext = memoryBundle.context;
+
+      this.streamEmitter.emit(projectId, 'architecture_agent', runId ?? '', 'decision', `Loaded ${memoryBundle.total} memory references for architecture context`);
+
       const docFiles = ['ARCHITECTURE.md', 'API.md', 'DEPLOYMENT.md'];
 
       // ── 2. Skip-generation check ───────────────────────────────────────────
@@ -89,6 +101,7 @@ export class ArchitectureAgentNode {
         .join('\n');
 
       if (process.env.MOCK_MODE === 'true') {
+        this.streamEmitter.emit(projectId, 'architecture_agent', runId ?? '', 'decision', 'Mock mode: generating predefined architecture docs');
         const artifacts = this.completeArtifacts(
           docFiles,
           [
@@ -104,6 +117,8 @@ export class ArchitectureAgentNode {
         await this.eventLog.logCompleted(state.projectId, 'architecture_agent', { inputTokens: 0, outputTokens: 0, model: 'mock' });
         return { artifacts };
       }
+
+      this.streamEmitter.emit(projectId, 'architecture_agent', runId ?? '', 'decision', `Calling LLM (${this.graphLlm.model()}) to generate architecture docs...`);
 
       // ── 4. LLM call ───────────────────────────────────────────────────────
       const result = await this.graphLlm.generateJson<Array<{
@@ -147,7 +162,6 @@ Generate these 3 documentation files:
    - Production deployment checklist
    - Health check endpoints`,
         expectedShape: 'array',
-        maxTokens: 6144,
       });
 
       const artifacts = this.completeArtifacts(
@@ -172,10 +186,20 @@ Generate these 3 documentation files:
         model: result.model,
       });
 
+      await this.prisma.artifact.createMany({
+        data: artifacts.map((a: GeneratedArtifact) => ({
+          projectId: state.projectId, agentType: a.agentType, filePath: a.filePath, content: a.content, language: a.language,
+        })),
+        skipDuplicates: true,
+      }).catch(() => {});
+
+      this.streamEmitter.emit(projectId, 'architecture_agent', runId ?? '', 'decision', `Architecture documentation complete: ${artifacts.length} files generated (${result.usage.outputTokens} output tokens)`);
+
       return { artifacts };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       this.logger.error(`[${state.projectId}] Architecture agent failed: ${message}`);
+      this.streamEmitter.emit(projectId, 'architecture_agent', runId ?? '', 'error', `Architecture generation failed: ${humanReadableError(message)}`);
       return { error: `ArchitectureAgentNode failed: ${message}` };
     }
   }

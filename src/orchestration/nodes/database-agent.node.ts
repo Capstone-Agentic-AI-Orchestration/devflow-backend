@@ -3,6 +3,9 @@ import { DevFlowStateType, GeneratedArtifact } from '../graph/devflow.state';
 import { MemoryService } from '../../memory/memory.service';
 import { EventLogService } from '../../supervisor/event-log.service';
 import { GraphLlmProvider } from '../providers/graph-llm.provider';
+import { PrismaService } from '../../prisma/prisma.service';
+import { StreamEmitter } from '../streaming/stream-emitter.service';
+import { humanReadableError } from './human-readable-error';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -19,22 +22,28 @@ export class DatabaseAgentNode {
   private readonly logger = new Logger(DatabaseAgentNode.name);
 
   constructor(
+    private readonly prisma: PrismaService,
     private readonly memory: MemoryService,
     private readonly eventLog: EventLogService,
     private readonly graphLlm: GraphLlmProvider,
+    private readonly streamEmitter: StreamEmitter,
   ) {}
 
   async execute(
     state: DevFlowStateType,
   ): Promise<Partial<DevFlowStateType>> {
-    this.logger.log(`[${state.projectId}] Database agent generating files`);
+    const { projectId, runId } = state;
+    this.logger.log(`[${projectId}] Database agent generating files`);
 
     if (!state.contract) {
+      this.streamEmitter.emit(projectId, 'database_agent', runId ?? '', 'error', 'Database agent skipped: contract is missing');
       return { error: 'DatabaseAgentNode: contract is null' };
     }
 
     // Log STARTED — allSettled inside, so failure here does not block the node.
-    await this.eventLog.logStarted(state.projectId, 'database_agent');
+    await this.eventLog.logStarted(projectId, 'database_agent');
+
+    this.streamEmitter.emit(projectId, 'database_agent', runId ?? '', 'decision', 'Starting database schema generation...');
 
     try {
       // ── 1. Read relevant memories ──────────────────────────────────────────
@@ -56,6 +65,8 @@ export class DatabaseAgentNode {
       });
       const memoryContext = memoryBundle.context;
 
+      this.streamEmitter.emit(projectId, 'database_agent', runId ?? '', 'decision', `Loaded ${memoryBundle.total} memory references for database context`);
+
       // ── 2. Build file list ───────────────────────────────────────────────
       const dbFiles = state.contract.fileManifest.filter((f) =>
         /\.(prisma|sql|seed\.(ts|js))$|README-database\.md$/i.test(f),
@@ -67,7 +78,7 @@ export class DatabaseAgentNode {
         'prisma/seed.ts',
         'README-database.md',
       ];
-      const allDbFiles = [...new Set([...coreFiles, ...dbFiles])].slice(0, 5);
+      const allDbFiles = [...new Set([...coreFiles, ...dbFiles])];
 
       // ── 2. Skip-generation check ───────────────────────────────────────────
       // Must run AFTER readRelevant so memory context is still available if the
@@ -97,6 +108,7 @@ export class DatabaseAgentNode {
       }
 
       if (process.env.MOCK_MODE === 'true') {
+        this.streamEmitter.emit(projectId, 'database_agent', runId ?? '', 'decision', 'Mock mode: generating predefined database files');
         const artifacts = this.completeArtifacts(
           allDbFiles,
           [
@@ -112,6 +124,8 @@ export class DatabaseAgentNode {
         await this.eventLog.logCompleted(state.projectId, 'database_agent', { inputTokens: 0, outputTokens: 0, model: 'mock' });
         return { artifacts };
       }
+
+      this.streamEmitter.emit(projectId, 'database_agent', runId ?? '', 'decision', `Calling LLM (${this.graphLlm.model()}) to generate database schema for ${allDbFiles.length} files...`);
 
       // ── 4. LLM call ───────────────────────────────────────────────────────
       const result = await this.graphLlm.generateJson<Array<{
@@ -140,7 +154,6 @@ Requirements:
 - prisma/seed.ts: Realistic seed data using @prisma/client
 - README-database.md: ERD description, migration guide, seeding instructions`,
         expectedShape: 'array',
-        maxTokens: 6144,
       });
 
       const artifacts = this.completeArtifacts(
@@ -165,10 +178,20 @@ Requirements:
         model: result.model,
       });
 
+      await this.prisma.artifact.createMany({
+        data: artifacts.map((a: GeneratedArtifact) => ({
+          projectId: state.projectId, agentType: a.agentType, filePath: a.filePath, content: a.content, language: a.language,
+        })),
+        skipDuplicates: true,
+      }).catch(() => {});
+
+      this.streamEmitter.emit(projectId, 'database_agent', runId ?? '', 'decision', `Database generation complete: ${artifacts.length} files generated (${result.usage.outputTokens} output tokens)`);
+
       return { artifacts };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       this.logger.error(`[${state.projectId}] Database agent failed: ${message}`);
+      this.streamEmitter.emit(projectId, 'database_agent', runId ?? '', 'error', `Database generation failed: ${humanReadableError(message)}`);
       return { error: `DatabaseAgentNode failed: ${message}` };
     }
   }

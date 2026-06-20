@@ -21,6 +21,30 @@ interface StatusPayload {
   error: string | null;
 }
 
+interface StateEventPayload {
+  projectId: string;
+  status: string;
+  currentNode: string;
+  nodeStatus: 'entering' | 'exiting' | 'running';
+  runId: string;
+  error: string | null;
+  timestamp: number;
+}
+
+interface StreamChunkPayload {
+  nodeId: string;
+  runId: string;
+  type: 'token' | 'tool-call' | 'decision' | 'error';
+  chunk: string;
+  metadata?: Record<string, unknown>;
+}
+
+interface StreamBatchPayload {
+  projectId: string;
+  nodeId: string;
+  chunks: StreamChunkPayload[];
+}
+
 @WebSocketGateway({
   cors: { origin: '*' },
   namespace: '/devflow',
@@ -59,6 +83,19 @@ export class DevFlowGateway implements OnGatewayConnection, OnGatewayDisconnect 
     this.logger.log(`Client ${client.id} subscribed to project ${projectId}`);
   }
 
+  @SubscribeMessage('resync')
+  handleResync(
+    @MessageBody() data: SubscribePayload & { status?: string; currentNode?: string; runId?: string },
+    @ConnectedSocket() client: Socket,
+  ): void {
+    const { projectId, status, currentNode, runId } = data;
+    if (!projectId) return;
+    void client.join(projectId);
+    if (status) {
+      this.emitStateSnapshot(client.id, projectId, status, currentNode ?? 'unknown', runId ?? '');
+    }
+  }
+
   @SubscribeMessage('unsubscribe')
   handleUnsubscribe(
     @MessageBody() data: SubscribePayload,
@@ -85,5 +122,64 @@ export class DevFlowGateway implements OnGatewayConnection, OnGatewayDisconnect 
     this.logger.log(
       `Emitted project:status to room ${projectId}: status=${status} node=${currentNode}`,
     );
+  }
+
+  /**
+   * Emits a granular orchestration state transition event.
+   * Used by OrchestrationService when nodes enter, run, or exit.
+   */
+  emitStateUpdate(
+    projectId: string,
+    status: string,
+    currentNode: string,
+    nodeStatus: 'entering' | 'exiting' | 'running',
+    runId: string,
+    error: string | null = null,
+  ): void {
+    const payload: StateEventPayload = {
+      projectId,
+      status,
+      currentNode,
+      nodeStatus,
+      runId,
+      error,
+      timestamp: Date.now(),
+    };
+    this.server.to(projectId).emit('orchestration:state', payload);
+  }
+
+  /**
+   * Emits batched agent stream chunks to subscribed clients.
+   * Called by StreamEmitter on batch flush.
+   */
+  emitAgentStream(
+    projectId: string,
+    nodeId: string,
+    chunks: StreamChunkPayload[],
+  ): void {
+    const payload: StreamBatchPayload = { projectId, nodeId, chunks };
+    this.server.to(projectId).emit('agent:stream', payload);
+  }
+
+  /**
+   * Emits the current state snapshot to a specific client (for reconnections).
+   */
+  emitStateSnapshot(
+    clientId: string,
+    projectId: string,
+    status: string,
+    currentNode: string,
+    runId: string,
+  ): void {
+    const payload: StateEventPayload = {
+      projectId,
+      status,
+      currentNode,
+      nodeStatus: 'running',
+      runId,
+      error: null,
+      timestamp: Date.now(),
+    };
+    this.server.to(clientId).emit('orchestration:state', payload);
   }
 }

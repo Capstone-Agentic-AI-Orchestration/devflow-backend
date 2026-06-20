@@ -6,6 +6,8 @@ import {
   RequirementsDocument,
 } from '../graph/devflow.state';
 import { GraphLlmProvider } from '../providers/graph-llm.provider';
+import { StreamEmitter } from '../streaming/stream-emitter.service';
+import { humanReadableError } from './human-readable-error';
 
 const SYSTEM_PROMPT = `You are a software architect analyzing a project brief.
 Return a valid JSON object with this exact shape:
@@ -32,18 +34,24 @@ export class RequirementsParserNode {
     private readonly prisma: PrismaService,
     private readonly memory: MemoryService,
     private readonly graphLlm: GraphLlmProvider,
+    private readonly streamEmitter: StreamEmitter,
   ) {}
 
   async execute(
     state: DevFlowStateType,
   ): Promise<Partial<DevFlowStateType>> {
-    this.logger.log(`[${state.projectId}] Parsing requirements`);
+    const { projectId, runId } = state;
+    this.logger.log(`[${projectId}] Parsing requirements`);
+
+    this.streamEmitter.emit(projectId, 'requirements_parser', runId ?? '', 'decision', 'Analyzing project brief to extract structured requirements...');
 
     try {
       await this.prisma.project.update({
-        where: { id: state.projectId },
+        where: { id: projectId },
         data: { status: 'PARSING_REQUIREMENTS' },
       });
+
+      this.streamEmitter.emit(projectId, 'requirements_parser', runId ?? '', 'decision', `Reading project memories for stack key "${state.stackKey}"`);
 
       const prompt = `You are a software architect analyzing a project brief to extract structured requirements.
 
@@ -68,15 +76,17 @@ Analyze this brief and produce a structured requirements document. Base the tech
           complexity: 'simple',
           estimatedFiles: 5,
         };
+        this.streamEmitter.emit(projectId, 'requirements_parser', runId ?? '', 'decision', 'Mock mode: returning predefined requirements');
         return { requirements, complexity: 'simple' };
       }
+
+      this.streamEmitter.emit(projectId, 'requirements_parser', runId ?? '', 'decision', `Calling LLM (${this.graphLlm.model()}) to parse requirements...`);
 
       const result = await this.graphLlm.generateJson<Partial<RequirementsDocument>>({
         agentName: 'requirements_parser',
         systemPrompt: SYSTEM_PROMPT,
         userPrompt: prompt,
         expectedShape: 'object',
-        maxTokens: 1500,
       });
 
       const parsed = result.value;
@@ -134,24 +144,30 @@ Analyze this brief and produce a structured requirements document. Base the tech
       // This builds the memory store's understanding of how briefs map to parsed
       // requirements for a given stack + project type. Future runs can reference
       // these entries to self-correct their own parsing output.
+      this.streamEmitter.emit(projectId, 'requirements_parser', runId ?? '', 'tool-call', 'Writing requirements to memory store', { operation: 'writeSkill', agentType: 'requirements' });
+
       await this.memory.writeSkill({
         agentType: 'requirements',
         systemPrompt: prompt,
         artifactContent: JSON.stringify(requirements, null, 2),
-        filePath: `requirements/${state.projectId}.json`,
-        projectId: state.projectId,
+        filePath: `requirements/${projectId}.json`,
+        projectId,
         stackKey: state.stackKey,
         projectType: requirements.projectType,
       });
 
+      this.streamEmitter.emit(projectId, 'requirements_parser', runId ?? '', 'decision', `Requirements parsed: ${requirements.complexity} complexity, ${requirements.estimatedFiles} estimated files, ${requirements.features.length} features`);
+
       return { requirements, complexity };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      this.logger.error(`[${state.projectId}] Requirements parsing failed: ${message}`);
+      this.logger.error(`[${projectId}] Requirements parsing failed: ${message}`);
+
+      this.streamEmitter.emit(projectId, 'requirements_parser', runId ?? '', 'error', `Requirements parsing failed: ${humanReadableError(message)}`);
 
       await this.prisma.project
         .update({
-          where: { id: state.projectId },
+          where: { id: projectId },
           data: { status: 'FAILED' },
         })
         .catch(() => undefined);
@@ -160,3 +176,5 @@ Analyze this brief and produce a structured requirements document. Base the tech
     }
   }
 }
+
+

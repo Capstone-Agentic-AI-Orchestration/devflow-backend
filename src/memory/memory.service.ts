@@ -454,36 +454,40 @@ export class MemoryService {
     stackKey: string,
     projectId?: string,
   ): Promise<MemoryRecord | null> {
-    const results = projectId
-      ? await this.queryMemories(
-          fileQuery,
-          Prisma.sql`
-            "agentType" = ${agentType}
-            AND "memoryType" = 'SKILL'::memory."AgentMemoryType"
-            AND (
-              ("scope" = 'PROJECT_AGENT'::memory."AgentMemoryScope" AND "projectId" = ${projectId})
-              OR ("scope" = 'AGENT_PRIVATE'::memory."AgentMemoryScope" AND "projectId" IS NULL)
-            )
-            AND ("expiresAt" IS NULL OR "expiresAt" > NOW())
-          `,
-          1,
-        )
-      : await this.readRelevant(agentType, fileQuery, 1);
-    const top = results[0];
+    try {
+      const results = projectId
+        ? await this.queryMemories(
+            fileQuery,
+            Prisma.sql`
+              "agentType" = ${agentType}
+              AND "memoryType" = 'SKILL'::memory."AgentMemoryType"
+              AND (
+                ("scope" = 'PROJECT_AGENT'::memory."AgentMemoryScope" AND "projectId" = ${projectId})
+                OR ("scope" = 'AGENT_PRIVATE'::memory."AgentMemoryScope" AND "projectId" IS NULL)
+              )
+              AND ("expiresAt" IS NULL OR "expiresAt" > NOW())
+            `,
+            1,
+          )
+        : await this.readRelevant(agentType, fileQuery, 1);
+      const top = results[0];
 
-    if (
-      top &&
-      top.memoryType === 'SKILL' &&
-      (top.similarity ?? 0) >= MemoryService.SKIP_THRESHOLD &&
-      top.metadata['stackKey'] === stackKey
-    ) {
-      this.logger.log(
-        `Skip-generation candidate found for ${agentType}/${fileQuery} (similarity=${top.similarity?.toFixed(3)})`,
-      );
-      return top;
+      if (
+        top &&
+        top.memoryType === 'SKILL' &&
+        (top.similarity ?? 0) >= MemoryService.SKIP_THRESHOLD &&
+        top.metadata['stackKey'] === stackKey
+      ) {
+        this.logger.log(
+          `Skip-generation candidate found for ${agentType}/${fileQuery} (similarity=${top.similarity?.toFixed(3)})`,
+        );
+        return top;
+      }
+
+      return null;
+    } catch {
+      return null;
     }
-
-    return null;
   }
 
   // Internal

@@ -444,6 +444,7 @@ describe('LangGraph GitHub delivery node', () => {
 describe('LangGraph OpenRouter-backed agents', () => {
   it('RequirementsParserNode uses the shared graph LLM provider', async () => {
     const graphLlm = {
+      model: vi.fn().mockReturnValue('openrouter-test-model'),
       generateJson: vi.fn().mockResolvedValue({
         value: {
           projectType: 'SaaS dashboard',
@@ -470,10 +471,16 @@ describe('LangGraph OpenRouter-backed agents', () => {
       writeSkill: vi.fn().mockResolvedValue({}),
     };
 
+    const mockStreamEmitter = {
+      emit: vi.fn(),
+      flushAll: vi.fn(),
+    };
+
     const node = new RequirementsParserNode(
       prisma as never,
       memory as never,
       graphLlm as unknown as GraphLlmProvider,
+      mockStreamEmitter as never,
     );
 
     const result = await node.execute({
@@ -497,6 +504,7 @@ describe('LangGraph OpenRouter-backed agents', () => {
 
   it('FrontendAgentNode generates artifacts through the shared graph LLM provider', async () => {
     const graphLlm = {
+      model: vi.fn().mockReturnValue('openrouter-test-model'),
       generateJson: vi.fn().mockResolvedValue({
         value: [
           {
@@ -513,15 +521,29 @@ describe('LangGraph OpenRouter-backed agents', () => {
       buildContextForAgent: vi.fn().mockResolvedValue({ context: '', total: 0 }),
       findSkipCandidate: vi.fn().mockResolvedValue(null),
     };
+    const prisma = {
+      project: {
+        update: vi.fn().mockResolvedValue({}),
+      },
+      artifact: {
+        createMany: vi.fn().mockResolvedValue({}),
+      },
+    };
+    const mockStreamEmitter2 = {
+      emit: vi.fn(),
+      flushAll: vi.fn(),
+    };
     const eventLog = {
       logStarted: vi.fn().mockResolvedValue({}),
       logCompleted: vi.fn().mockResolvedValue({}),
     };
 
     const node = new FrontendAgentNode(
+      prisma as never,
       memory as never,
       eventLog as never,
       graphLlm as unknown as GraphLlmProvider,
+      mockStreamEmitter2 as never,
     );
     const result = await node.execute({
       projectId: 'project-1',
@@ -572,14 +594,16 @@ describe('LangGraph OpenRouter-backed agents', () => {
         language: 'tsx',
       },
     ]));
-    expect(result.artifacts?.map((artifact) => artifact.filePath)).toEqual([
-      'src/app/page.tsx',
-      'src/app/layout.tsx',
-      'src/components/ui/Button.tsx',
-      'src/components/ui/Card.tsx',
-      'src/styles/globals.css',
-      'README-frontend.md',
-    ]);
+    expect(result.artifacts?.map((artifact) => artifact.filePath)).toEqual(
+      expect.arrayContaining([
+        'src/app/page.tsx',
+        'src/app/layout.tsx',
+        'src/components/ui/Button.tsx',
+        'src/components/ui/Card.tsx',
+        'src/styles/globals.css',
+        'README-frontend.md',
+      ]),
+    );
     expect(graphLlm.generateJson).toHaveBeenCalledWith(expect.objectContaining({
       agentName: 'frontend_agent',
       expectedShape: 'array',

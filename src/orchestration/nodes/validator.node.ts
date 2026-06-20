@@ -1,6 +1,8 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { DevFlowStateType } from '../graph/devflow.state';
 import { MemoryService } from '../../memory/memory.service';
+import { StreamEmitter } from '../streaming/stream-emitter.service';
+import { humanReadableError } from './human-readable-error';
 
 // ─── Validation Result ────────────────────────────────────────────────────────
 
@@ -19,30 +21,41 @@ export class ValidatorNode {
   private readonly logger = new Logger(ValidatorNode.name);
   private static readonly MAX_RETRIES = 3;
 
-  constructor(private readonly memory: MemoryService) {}
+  constructor(
+    private readonly memory: MemoryService,
+    private readonly streamEmitter: StreamEmitter,
+  ) {}
 
   async execute(
     state: DevFlowStateType,
   ): Promise<Partial<DevFlowStateType>> {
+    const { projectId, runId } = state;
     this.logger.log(
-      `[${state.projectId}] Validating outputs (attempt ${state.retryCount + 1}/${ValidatorNode.MAX_RETRIES})`,
+      `[${projectId}] Validating outputs (attempt ${state.retryCount + 1}/${ValidatorNode.MAX_RETRIES})`,
     );
 
     if (!state.contract) {
+      this.streamEmitter.emit(projectId, 'validator', runId ?? '', 'error', 'Validator skipped: contract is missing');
       return { error: 'ValidatorNode: contract is null' };
     }
 
     try {
+      if (process.env.MOCK_MODE === 'true') {
+        this.streamEmitter.emit(projectId, 'validator', runId ?? '', 'decision', 'Mock mode: returning pass validation');
+      }
       const result = this.validate(state);
 
       if (result.valid) {
         this.logger.log(`[${state.projectId}] Validation passed`);
+        this.streamEmitter.emit(projectId, 'validator', runId ?? '', 'decision', 'Validation passed: all artifacts meet contract requirements');
         return {};
       }
 
       this.logger.warn(
         `[${state.projectId}] Validation failed: missing=${result.missingFiles.length}, syntax=${result.syntaxIssues.length}, schema=${result.schemaIssues.length}`,
       );
+
+      this.streamEmitter.emit(projectId, 'validator', runId ?? '', 'decision', `Validation failed: ${result.missingFiles.length} missing files, ${result.syntaxIssues.length} syntax issues, ${result.schemaIssues.length} schema issues`);
 
       // ── Write validation errors as MISTAKE memories for each affected agent ─
       // These records teach future runs which patterns led to validator failures,
@@ -105,6 +118,7 @@ export class ValidatorNode {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       this.logger.error(`[${state.projectId}] Validator failed: ${message}`);
+      this.streamEmitter.emit(projectId, 'validator', runId ?? '', 'error', `Validation failed: ${humanReadableError(message)}`);
       return { error: `ValidatorNode failed: ${message}` };
     }
   }

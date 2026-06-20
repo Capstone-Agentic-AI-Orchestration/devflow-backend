@@ -370,7 +370,6 @@ export class LlmAgentProvider implements WorkOrderAgentProvider {
         system,
         messages: [{ role: 'user', content: user }],
         temperature,
-        max_tokens: 1200,
       };
     }
 
@@ -378,7 +377,6 @@ export class LlmAgentProvider implements WorkOrderAgentProvider {
       model,
       messages,
       temperature,
-      max_tokens: 1200,
       response_format: this.responseFormat(schemaName),
     };
   }

@@ -1,8 +1,8 @@
 export type LlmProviderName = 'openrouter' | 'openai' | 'anthropic' | 'opencode' | 'gemini';
 
-const DEFAULT_LLM_REQUEST_TIMEOUT_MS = 120_000;
-const DEFAULT_LLM_CONCURRENCY_LIMIT = 4;
-const MAX_LLM_CONCURRENCY_LIMIT = 20;
+const DEFAULT_LLM_REQUEST_TIMEOUT_MS = 600_000;
+const DEFAULT_LLM_CONCURRENCY_LIMIT = 50;
+const MAX_LLM_CONCURRENCY_LIMIT = 100;
 
 let activeRequests = 0;
 const waitingRequests: Array<() => void> = [];

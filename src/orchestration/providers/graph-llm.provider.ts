@@ -163,7 +163,7 @@ export class GraphLlmProvider {
         systemPrompt: 'Return one minimal JSON object only.',
         userPrompt: 'Return {"ok":true}.',
         expectedShape: 'object',
-        maxTokens: 32,
+        maxTokens: 256,
       });
 
       return {
@@ -394,7 +394,7 @@ export class GraphLlmProvider {
         system,
         messages: [{ role: 'user', content: user }],
         temperature,
-        max_tokens: options.maxTokens ?? 4096,
+        ...(options.maxTokens ? { max_tokens: options.maxTokens } : {}),
       };
     }
 
@@ -402,7 +402,7 @@ export class GraphLlmProvider {
       model,
       messages,
       temperature,
-      max_tokens: options.maxTokens ?? 4096,
+      ...(options.maxTokens ? { max_tokens: options.maxTokens } : {}),
       ...this.responseFormat(options),
     };
   }

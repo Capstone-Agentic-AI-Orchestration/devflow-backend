@@ -4,6 +4,8 @@ import { DevFlowStateType, ProjectContract } from '../graph/devflow.state';
 import { MemoryService } from '../../memory/memory.service';
 import { EventLogService } from '../../supervisor/event-log.service';
 import { GraphLlmProvider } from '../providers/graph-llm.provider';
+import { StreamEmitter } from '../streaming/stream-emitter.service';
+import { humanReadableError } from './human-readable-error';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -32,23 +34,28 @@ export class ContractNegotiatorNode {
     private readonly memory: MemoryService,
     private readonly eventLog: EventLogService,
     private readonly graphLlm: GraphLlmProvider,
+    private readonly streamEmitter: StreamEmitter,
   ) {}
 
   async execute(
     state: DevFlowStateType,
   ): Promise<Partial<DevFlowStateType>> {
-    this.logger.log(`[${state.projectId}] Negotiating project contract`);
+    const { projectId, runId } = state;
+    this.logger.log(`[${projectId}] Negotiating project contract`);
 
     if (!state.requirements) {
+      this.streamEmitter.emit(projectId, 'contract_negotiator', runId ?? '', 'error', 'Contract negotiation skipped: requirements are missing');
       return { error: 'ContractNegotiatorNode: requirements is null' };
     }
 
     // Log STARTED — allSettled inside, so failure here does not block the node.
-    await this.eventLog.logStarted(state.projectId, 'contract_negotiator');
+    await this.eventLog.logStarted(projectId, 'contract_negotiator');
+
+    this.streamEmitter.emit(projectId, 'contract_negotiator', runId ?? '', 'decision', 'Generating project contract from parsed requirements...');
 
     try {
       await this.prisma.project.update({
-        where: { id: state.projectId },
+        where: { id: projectId },
         data: { status: 'NEGOTIATING_CONTRACT' },
       });
 
@@ -65,9 +72,11 @@ export class ContractNegotiatorNode {
         .filter(Boolean)
         .join(' ');
 
+      this.streamEmitter.emit(projectId, 'contract_negotiator', runId ?? '', 'tool-call', 'Reading relevant contract patterns from memory', { operation: 'buildContextForAgent', agentType: 'contract' });
+
       const memoryBundle = await this.memory.buildContextForAgent({
         agentType: 'contract',
-        projectId: state.projectId,
+        projectId,
         query: memoryQuery,
       });
       const memoryContext = memoryBundle.context;
@@ -76,7 +85,7 @@ export class ContractNegotiatorNode {
 
       if (process.env.MOCK_MODE === 'true') {
         const contract: ProjectContract = {
-          projectId: state.projectId,
+          projectId,
           projectName: state.companyName.replace(/[^a-zA-Z]/g, '') + 'App',
           description: 'Mocked contract for basic fullstack application',
           requirements: state.requirements,
@@ -84,13 +93,16 @@ export class ContractNegotiatorNode {
           acceptanceCriteria: ['Must compile', 'Must pass mock tests'],
           lockedAt: new Date().toISOString()
         };
-        await this.eventLog.logCompleted(state.projectId, 'contract_negotiator', {
+        this.streamEmitter.emit(projectId, 'contract_negotiator', runId ?? '', 'decision', 'Mock mode: returning predefined contract');
+        await this.eventLog.logCompleted(projectId, 'contract_negotiator', {
           inputTokens: 0,
           outputTokens: 0,
           model: 'mock',
         });
         return { contract };
       }
+
+      this.streamEmitter.emit(projectId, 'contract_negotiator', runId ?? '', 'decision', `Calling LLM (${this.graphLlm.model()}) to negotiate contract with ${memoryBundle.total} memory references...`);
 
       // ── 2. LLM call ───────────────────────────────────────────────────────
       const result = await this.graphLlm.generateJson<Record<string, unknown>>({
@@ -113,7 +125,6 @@ Produce a fileManifest that lists every file that will be generated (frontend, b
 Include 8–20 files depending on complexity. Use realistic relative paths (e.g. "src/app/page.tsx", "src/modules/users/users.service.ts").
 Produce 5–10 acceptance criteria as clear, testable statements.`,
         expectedShape: 'object',
-        maxTokens: 4096,
       });
 
       const parsed = result.value;
@@ -135,11 +146,14 @@ Produce 5–10 acceptance criteria as clear, testable statements.`,
       };
 
       this.logger.log(
-        `[${state.projectId}] Contract negotiated: ${contract.fileManifest.length} files in manifest (${memoryBundle.total} layered memories referenced)`,
+        `[${projectId}] Contract negotiated: ${contract.fileManifest.length} files in manifest (${memoryBundle.total} layered memories referenced)`,
       );
 
+      this.streamEmitter.emit(projectId, 'contract_negotiator', runId ?? '', 'tool-call', `Contract generated: ${contract.fileManifest.length} files across ${contract.acceptanceCriteria.length} acceptance criteria`);
+      this.streamEmitter.emit(projectId, 'contract_negotiator', runId ?? '', 'decision', 'Contract ready for architecture review');
+
       // Log COMPLETED with cost metadata — budget is updated atomically inside.
-      await this.eventLog.logCompleted(state.projectId, 'contract_negotiator', {
+      await this.eventLog.logCompleted(projectId, 'contract_negotiator', {
         inputTokens: result.usage.inputTokens,
         outputTokens: result.usage.outputTokens,
         model: result.model,
@@ -148,11 +162,13 @@ Produce 5–10 acceptance criteria as clear, testable statements.`,
       return { contract };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      this.logger.error(`[${state.projectId}] Contract negotiation failed: ${message}`);
+      this.logger.error(`[${projectId}] Contract negotiation failed: ${message}`);
+
+      this.streamEmitter.emit(projectId, 'contract_negotiator', runId ?? '', 'error', `Contract negotiation failed: ${humanReadableError(message)}`);
 
       await this.prisma.project
         .update({
-          where: { id: state.projectId },
+          where: { id: projectId },
           data: { status: 'FAILED' },
         })
         .catch(() => undefined);

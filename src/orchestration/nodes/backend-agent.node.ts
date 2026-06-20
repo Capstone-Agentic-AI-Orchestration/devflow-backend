@@ -3,6 +3,9 @@ import { DevFlowStateType, GeneratedArtifact } from '../graph/devflow.state';
 import { MemoryService } from '../../memory/memory.service';
 import { EventLogService } from '../../supervisor/event-log.service';
 import { GraphLlmProvider } from '../providers/graph-llm.provider';
+import { PrismaService } from '../../prisma/prisma.service';
+import { StreamEmitter } from '../streaming/stream-emitter.service';
+import { humanReadableError } from './human-readable-error';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -19,22 +22,28 @@ export class BackendAgentNode {
   private readonly logger = new Logger(BackendAgentNode.name);
 
   constructor(
+    private readonly prisma: PrismaService,
     private readonly memory: MemoryService,
     private readonly eventLog: EventLogService,
     private readonly graphLlm: GraphLlmProvider,
+    private readonly streamEmitter: StreamEmitter,
   ) {}
 
   async execute(
     state: DevFlowStateType,
   ): Promise<Partial<DevFlowStateType>> {
-    this.logger.log(`[${state.projectId}] Backend agent generating files`);
+    const { projectId, runId } = state;
+    this.logger.log(`[${projectId}] Backend agent generating files`);
 
     if (!state.contract) {
+      this.streamEmitter.emit(projectId, 'backend_agent', runId ?? '', 'error', 'Backend agent skipped: contract is missing');
       return { error: 'BackendAgentNode: contract is null' };
     }
 
     // Log STARTED — allSettled inside, so failure here does not block the node.
-    await this.eventLog.logStarted(state.projectId, 'backend_agent');
+    await this.eventLog.logStarted(projectId, 'backend_agent');
+
+    this.streamEmitter.emit(projectId, 'backend_agent', runId ?? '', 'decision', 'Starting backend code generation...');
 
     try {
       // ── 1. Read relevant memories before LLM call ──────────────────────────
@@ -56,6 +65,8 @@ export class BackendAgentNode {
       });
       const memoryContext = memoryBundle.context;
 
+      this.streamEmitter.emit(projectId, 'backend_agent', runId ?? '', 'decision', `Loaded ${memoryBundle.total} memory references for backend context`);
+
       // ── 2. Build file list ───────────────────────────────────────────────
       const backendFiles = state.contract.fileManifest.filter((f) =>
         /\.(module|controller|service|dto|guard|pipe|interceptor)\.ts$|README-backend\.md$/i.test(f),
@@ -72,7 +83,7 @@ export class BackendAgentNode {
       ];
       const allBackendFiles = [
         ...new Set([...coreFiles, ...backendFiles]),
-      ].slice(0, 8);
+      ];
 
       // ── 2. Skip-generation check ───────────────────────────────────────────
       // Must run AFTER readRelevant so memory context is still available if the
@@ -102,6 +113,7 @@ export class BackendAgentNode {
       }
 
       if (process.env.MOCK_MODE === 'true') {
+        this.streamEmitter.emit(projectId, 'backend_agent', runId ?? '', 'decision', 'Mock mode: generating predefined backend files');
         const artifacts = this.completeArtifacts(
           allBackendFiles,
           [
@@ -117,6 +129,8 @@ export class BackendAgentNode {
         await this.eventLog.logCompleted(state.projectId, 'backend_agent', { inputTokens: 0, outputTokens: 0, model: 'mock' });
         return { artifacts };
       }
+
+      this.streamEmitter.emit(projectId, 'backend_agent', runId ?? '', 'decision', `Calling LLM (${this.graphLlm.model()}) to generate backend code for ${allBackendFiles.length} files...`);
 
       // ── 4. LLM call ───────────────────────────────────────────────────────
       const result = await this.graphLlm.generateJson<Array<{
@@ -146,7 +160,6 @@ Generate complete NestJS code with:
 - Swagger/OpenAPI decorators where appropriate
 - For README-backend.md: include API documentation, setup guide, and architecture notes`,
         expectedShape: 'array',
-        maxTokens: 8192,
       });
 
       const artifacts = this.completeArtifacts(
@@ -164,6 +177,87 @@ Generate complete NestJS code with:
         `[${state.projectId}] Backend agent generated ${artifacts.length} files (${memoryBundle.total} layered memories injected)`,
       );
 
+      // ── 5. Inject bootstrapping configs ────────────────────────────────────
+      const projectName = state.contract.projectName.replace(/[^a-z0-9-]/gi, '-').toLowerCase();
+      const configFiles: GeneratedArtifact[] = [
+        {
+          agentType: 'backend',
+          filePath: 'nest-cli.json',
+          content: JSON.stringify({
+            $schema: 'https://json.schemastore.org/nest-cli',
+            collection: '@nestjs/schematics',
+            sourceRoot: 'src',
+          }, null, 2),
+          language: 'json',
+        },
+        {
+          agentType: 'backend',
+          filePath: 'tsconfig.build.json',
+          content: JSON.stringify({
+            extends: './tsconfig.json',
+            exclude: ['node_modules', 'test', 'dist', '**/*spec.ts'],
+          }, null, 2),
+          language: 'json',
+        },
+      ];
+      for (const cfg of configFiles) {
+        const idx = artifacts.findIndex((a) => a.filePath === cfg.filePath);
+        if (idx >= 0) artifacts[idx] = cfg;
+        else artifacts.push(cfg);
+      }
+
+      // ── 6. Override README-backend.md ──────────────────────────────────────
+      const readmeIdx = artifacts.findIndex((a) => a.filePath === 'README-backend.md');
+      if (readmeIdx >= 0) {
+        artifacts[readmeIdx].content = `# ${state.contract.projectName} — Backend
+
+Generated by DevFlow.
+
+## Quick start
+
+\`\`\`bash
+npm install
+npm run start:dev
+\`\`\`
+
+The API listens on http://localhost:4001 by default.
+
+## Project structure
+
+\`\`\`
+.
+├── src/
+│   ├── main.ts                     # Application entrypoint
+│   ├── app.module.ts               # Root module
+│   └── modules/
+│       └── core/
+│           ├── core.module.ts
+│           ├── core.controller.ts
+│           ├── core.service.ts
+│           └── dto/
+│               └── create-item.dto.ts
+├── nest-cli.json
+├── tsconfig.build.json
+├── package.json
+└── README-backend.md
+\`\`\`
+
+## Available scripts
+
+| Command | Description |
+|---------|-------------|
+| \`npm run start:dev\` | Hot-reload development |
+| \`npm run build\` | Production build |
+| \`npm run start\` | Start production server |
+
+## Tech stack
+
+- **Framework:** NestJS 10
+- **Language:** TypeScript
+- **Database:** PostgreSQL via Prisma
+`;
+      }
+
       // Log COMPLETED with cost metadata — budget is updated atomically inside.
       await this.eventLog.logCompleted(state.projectId, 'backend_agent', {
         inputTokens: result.usage.inputTokens,
@@ -171,10 +265,27 @@ Generate complete NestJS code with:
         model: result.model,
       });
 
+      // Persist artifacts to DB immediately so the frontend sees them
+      await this.prisma.artifact.createMany({
+        data: artifacts.map((a: GeneratedArtifact) => ({
+          projectId: state.projectId,
+          agentType: a.agentType,
+          filePath: a.filePath,
+          content: a.content,
+          language: a.language,
+        })),
+        skipDuplicates: true,
+      }).catch((err: unknown) => {
+        this.logger.warn(`[${state.projectId}] Artifact persist failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+      });
+
+      this.streamEmitter.emit(projectId, 'backend_agent', runId ?? '', 'decision', `Backend generation complete: ${artifacts.length} files generated (${result.usage.outputTokens} output tokens)`);
+
       return { artifacts };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       this.logger.error(`[${state.projectId}] Backend agent failed: ${message}`);
+      this.streamEmitter.emit(projectId, 'backend_agent', runId ?? '', 'error', `Backend generation failed: ${humanReadableError(message)}`);
       return { error: `BackendAgentNode failed: ${message}` };
     }
   }

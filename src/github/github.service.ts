@@ -58,6 +58,7 @@ export class GithubService implements OnModuleInit {
   private hasAppId = false;
   private hasPrivateKey = false;
   private privateKeyValid = false;
+  private hasToken = false;
 
   constructor(private readonly configService: ConfigService) {}
 
@@ -72,6 +73,15 @@ export class GithubService implements OnModuleInit {
     ) ?? 0;
     this.ownerLogin = this.configService.get<string>('github.org') ?? '';
     this.ownerSource = this.ownerLogin ? 'env' : null;
+    this.hasToken = Boolean(this.configService.get<string>('github.token'));
+
+    if (this.hasToken) {
+      this.logger.log('GitHub PAT configured; using personal access token for repo operations');
+      this.octokit = new Octokit({
+        auth: this.configService.get<string>('github.token'),
+      });
+      return;
+    }
 
     if (!appId || !privateKey || !this.privateKeyValid || !this.installationId) {
       this.logger.warn(
@@ -132,13 +142,52 @@ export class GithubService implements OnModuleInit {
     this.assertConfigured();
     this.logger.log(`Creating repository: ${name}`);
     const owner = await this.getOwner();
+
+    if (this.hasToken) {
+      const url = this.ownerLogin
+        ? `https://api.github.com/orgs/${encodeURIComponent(this.ownerLogin)}/repos`
+        : 'https://api.github.com/user/repos';
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${this.configService.get<string>('github.token')}`,
+          'Content-Type': 'application/json',
+          Accept: 'application/vnd.github+json',
+        },
+        body: JSON.stringify({
+          name,
+          private: true,
+          auto_init: true,
+          description: `Scaffolded by DevFlow`,
+        }),
+      });
+      if (!response.ok) {
+        const body = await response.text();
+        throw new Error(`GitHub repo creation failed (${response.status}): ${body.slice(0, 300)}`);
+      }
+      const data = await response.json();
+      this.logger.log(`Repository created: ${data.clone_url}`);
+      return data.clone_url;
+    }
+
+    // No PAT — try via GitHub App installation (org accounts only).
+    const { data: installation } = await this.octokit.apps.getInstallation({
+      installation_id: this.installationId,
+    });
+    const isOrg = installation.account && 'type' in installation.account && installation.account.type === 'Organization';
+    if (!isOrg) {
+      throw new Error(
+        `GitHub App installation on user account "${owner}" cannot create repos. Set GITHUB_TOKEN to a personal access token with repo scope.`,
+      );
+    }
+
     const { data } = await this.octokit.repos.createInOrg({
       org: owner,
       name,
       private: true,
-      auto_init: true,
       description: `Scaffolded by DevFlow`,
     });
+
     this.logger.log(`Repository created: ${data.clone_url}`);
     return data.clone_url;
   }
@@ -155,6 +204,36 @@ export class GithubService implements OnModuleInit {
         permissions: null,
         reason: status.reason,
       };
+    }
+
+    if (this.hasToken) {
+      const owner = this.ownerLogin || (await this.getOwner());
+      try {
+        const { data: repos } = await this.octokit.repos.listForOrg({
+          org: owner,
+          per_page: 1,
+        });
+        return {
+          ok: true,
+          status,
+          owner,
+          installationOwner: null,
+          repositoriesVisible: repos.length,
+          permissions: {},
+          reason: null,
+        };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return {
+          ok: false,
+          status,
+          owner,
+          installationOwner: null,
+          repositoriesVisible: null,
+          permissions: null,
+          reason: `PAT verification failed: ${message}`,
+        };
+      }
     }
 
     try {
@@ -222,13 +301,22 @@ export class GithubService implements OnModuleInit {
     );
     const owner = await this.getOwner();
 
+    // Get the repo info to determine the default branch
+    const { data: repo } = await this.octokit.repos.get({
+      owner,
+      repo: repoName,
+    });
+    const defaultBranch = repo.default_branch;
+
+    // Get the latest commit on the default branch to use as parent
     const { data: refData } = await this.octokit.git.getRef({
       owner,
       repo: repoName,
-      ref: 'heads/main',
+      ref: `heads/${defaultBranch}`,
     });
     const latestCommitSha = refData.object.sha;
 
+    // Get the base tree from the latest commit
     const { data: commitData } = await this.octokit.git.getCommit({
       owner,
       repo: repoName,
@@ -236,6 +324,7 @@ export class GithubService implements OnModuleInit {
     });
     const baseTreeSha = commitData.tree.sha;
 
+    // Create blobs for all artifacts in parallel
     const treeItems = await Promise.all(
       artifacts.map(async (artifact) => {
         const { data: blobData } = await this.octokit.git.createBlob({
@@ -253,6 +342,7 @@ export class GithubService implements OnModuleInit {
       }),
     );
 
+    // Create a new tree pointing to the new blobs
     const { data: treeData } = await this.octokit.git.createTree({
       owner,
       repo: repoName,
@@ -260,6 +350,7 @@ export class GithubService implements OnModuleInit {
       tree: treeItems,
     });
 
+    // Create a single commit
     const { data: newCommit } = await this.octokit.git.createCommit({
       owner,
       repo: repoName,
@@ -268,10 +359,11 @@ export class GithubService implements OnModuleInit {
       parents: [latestCommitSha],
     });
 
+    // Update the branch ref
     await this.octokit.git.updateRef({
       owner,
       repo: repoName,
-      ref: 'heads/main',
+      ref: `heads/${defaultBranch}`,
       sha: newCommit.sha,
     });
 
@@ -302,6 +394,10 @@ export class GithubService implements OnModuleInit {
 
   private missingRequirements(): string[] {
     const missing: string[] = [];
+    if (this.hasToken) {
+      if (!this.ownerLogin) missing.push('GITHUB_ORG');
+      return [...new Set(missing)];
+    }
     if (!this.hasAppId) missing.push('GITHUB_APP_ID');
     if (!this.hasPrivateKey) missing.push('GITHUB_PRIVATE_KEY');
     if (this.hasPrivateKey && !this.privateKeyValid) missing.push('valid GITHUB_PRIVATE_KEY');

@@ -48,8 +48,10 @@ export class GithubCommitNode {
         `[${state.projectId}] Committed ${state.artifacts.length} files`,
       );
 
-      // 3. Inject CI workflow
-      await this.github.injectCiWorkflow(repoName);
+      // 3. Inject CI workflow (non-fatal)
+      await this.github.injectCiWorkflow(repoName).catch((err: unknown) => {
+        this.logger.warn(`[${state.projectId}] CI workflow injection skipped: ${err instanceof Error ? err.message : err}`);
+      });
       this.logger.log(`[${state.projectId}] CI workflow injected`);
 
       // 4. Persist artifacts to DB

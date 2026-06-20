@@ -43,6 +43,7 @@ export const envSchema = z.object({
   GITHUB_PRIVATE_KEY: z.string().optional().default(''),
   GITHUB_INSTALLATION_ID: z.string().optional().default(''),
   GITHUB_ORG: z.string().optional().default(''),
+  GITHUB_TOKEN: z.string().optional().default(''),
   PORT: z
     .string()
     .optional()

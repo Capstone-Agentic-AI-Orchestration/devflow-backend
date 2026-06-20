@@ -18,6 +18,7 @@ import { ArtifactContractValidator } from './providers/artifact-contract.validat
 import { GraphLlmProvider } from './providers/graph-llm.provider';
 import { LlmAgentProvider } from './providers/llm-agent.provider';
 import { MockAgentProvider } from './providers/mock-agent.provider';
+import { StreamEmitter } from './streaming/stream-emitter.service';
 
 @Module({
   imports: [
@@ -46,6 +47,7 @@ import { MockAgentProvider } from './providers/mock-agent.provider';
     GraphLlmProvider,
     LlmAgentProvider,
     MockAgentProvider,
+    StreamEmitter,
   ],
   exports: [OrchestrationService],
 })

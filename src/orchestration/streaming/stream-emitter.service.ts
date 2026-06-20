@@ -1,0 +1,75 @@
+import { Injectable, Logger, Optional } from '@nestjs/common';
+import { DevFlowGateway } from '../../gateway/devflow.gateway';
+
+export interface StreamChunk {
+  nodeId: string;
+  runId: string;
+  type: 'token' | 'tool-call' | 'decision' | 'error';
+  chunk: string;
+  metadata?: Record<string, unknown>;
+}
+
+interface BatchEntry {
+  projectId: string;
+  nodeId: string;
+  chunks: StreamChunk[];
+  timer: ReturnType<typeof setTimeout> | null;
+}
+
+@Injectable()
+export class StreamEmitter {
+  private readonly logger = new Logger(StreamEmitter.name);
+  private readonly batches = new Map<string, BatchEntry>();
+  private readonly BATCH_WINDOW_MS = 50;
+
+  constructor(
+    @Optional() private readonly gateway: DevFlowGateway | null,
+  ) {}
+
+  emit(projectId: string, nodeId: string, runId: string, type: StreamChunk['type'], chunk: string, metadata?: Record<string, unknown>): void {
+    const key = `${projectId}:${nodeId}`;
+    const entry: StreamChunk = { nodeId, runId, type, chunk, metadata };
+
+    let batch = this.batches.get(key);
+    if (!batch) {
+      batch = { projectId, nodeId, chunks: [], timer: null };
+      this.batches.set(key, batch);
+    }
+
+    batch.chunks.push(entry);
+
+    if (!batch.timer) {
+      batch.timer = setTimeout(() => this.flush(key), this.BATCH_WINDOW_MS);
+    }
+  }
+
+  private flush(key: string): void {
+    const batch = this.batches.get(key);
+    if (!batch) return;
+
+    batch.timer = null;
+    this.batches.delete(key);
+
+    if (!this.gateway) return;
+
+    const { projectId, nodeId, chunks } = batch;
+
+    try {
+      this.gateway.emitAgentStream(projectId, nodeId, chunks);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.logger.error(`Failed to emit agent stream for ${key}: ${message}`);
+    }
+  }
+
+  flushAll(projectId: string): void {
+    for (const [key, batch] of this.batches.entries()) {
+      if (batch.projectId === projectId) {
+        if (batch.timer) {
+          clearTimeout(batch.timer);
+        }
+        this.flush(key);
+      }
+    }
+  }
+}

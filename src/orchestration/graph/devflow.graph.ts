@@ -161,55 +161,27 @@ export function buildDevFlowGraph(
   graph.addConditionalEdges(NODE.GATE_1_CHECK, (state: any) => {
     if (state.error) return END;
 
-    if (state.complexity === 'complex') {
-      logger.log(
-        `[${state.projectId}] Complexity=complex — dispatching code agents in parallel`,
-      );
-      // Send() dispatches each agent as an independent parallel branch.
-      // All branches merge at validate_outputs via the artifacts reducer.
-      return [
-        new Send(NODE.FRONTEND_AGENT, state),
-        new Send(NODE.BACKEND_AGENT, state),
-        new Send(NODE.DATABASE_AGENT, state),
-        new Send(NODE.ARCHITECTURE_AGENT, state),
-      ];
-    }
-
-    // sequential path for simple / medium complexity
     logger.log(
-      `[${state.projectId}] Complexity=${state.complexity ?? 'unknown'} — sequential code generation`,
+      `[${state.projectId}] Dispatching all code agents in parallel`,
     );
-    return NODE.FRONTEND_AGENT;
+    return [
+      new Send(NODE.FRONTEND_AGENT, state),
+      new Send(NODE.BACKEND_AGENT, state),
+      new Send(NODE.DATABASE_AGENT, state),
+      new Send(NODE.ARCHITECTURE_AGENT, state),
+    ];
   });
 
   // ── Code-gen node routing ──────────────────────────────────────────────────
   //
-  // Each code-gen node uses a conditional edge that reads state.complexity:
-  //
-  //   'complex'  (parallel path via Send()):
-  //     Each agent was dispatched independently; route directly to validate_outputs.
-  //     LangGraph merges all parallel branch updates via the artifacts reducer
-  //     (existing, next) => [...existing, ...next] before continuing.
-  //
-  //   'simple' | 'medium' (sequential path):
-  //     Chain through the pipeline: frontend → backend → database → architecture
-  //     → validate_outputs.
+  // All agents run in parallel (via Send() above). Each routes directly to
+  // validate_outputs. LangGraph merges all parallel branch updates via the
+  // artifacts reducer (existing, next) => [...existing, ...next] before
+  // continuing.
 
-  graph.addConditionalEdges(NODE.FRONTEND_AGENT, (state: any) => {
-    if (state.complexity === 'complex') return NODE.VALIDATE_OUTPUTS;
-    return NODE.BACKEND_AGENT;
-  });
-
-  graph.addConditionalEdges(NODE.BACKEND_AGENT, (state: any) => {
-    if (state.complexity === 'complex') return NODE.VALIDATE_OUTPUTS;
-    return NODE.DATABASE_AGENT;
-  });
-
-  graph.addConditionalEdges(NODE.DATABASE_AGENT, (state: any) => {
-    if (state.complexity === 'complex') return NODE.VALIDATE_OUTPUTS;
-    return NODE.ARCHITECTURE_AGENT;
-  });
-
+  graph.addEdge(NODE.FRONTEND_AGENT, NODE.VALIDATE_OUTPUTS);
+  graph.addEdge(NODE.BACKEND_AGENT, NODE.VALIDATE_OUTPUTS);
+  graph.addEdge(NODE.DATABASE_AGENT, NODE.VALIDATE_OUTPUTS);
   graph.addEdge(NODE.ARCHITECTURE_AGENT, NODE.VALIDATE_OUTPUTS);
 
   // After validation:
