@@ -208,6 +208,15 @@ export class RunSupervisorService {
    * Applies the recovery strategy to a single stuck project.
    */
   private async handleStuckProject(project: StuckProject): Promise<void> {
+    // Manual intervention takes precedence over automatic recovery. A project
+    // paused via the control API is intentionally idle — do not auto-retry it.
+    if (this.orchestration.isManuallyHalted(project.id)) {
+      this.logger.log(
+        `[${project.id}] Skipping auto-recovery — run is manually paused.`,
+      );
+      return;
+    }
+
     const budgetExhausted = project.tokensConsumed >= project.tokenBudget;
     const retriesExhausted = project.retryCount >= project.maxRetries;
 

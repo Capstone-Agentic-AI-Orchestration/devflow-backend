@@ -126,11 +126,13 @@ export interface WriteProjectCoreMemoryInput {
 export class MemoryService {
   private readonly logger = new Logger(MemoryService.name);
 
-  /** Similarity threshold for the skip-generation path. */
   static readonly SKIP_THRESHOLD = 0.92;
 
-  /** Number of memories to inject per agent invocation. */
   static readonly TOP_K = 3;
+
+  static readonly MEMORY_TTL_DAYS = 90;
+
+  static readonly MISTAKE_TTL_DAYS = 180;
 
   constructor(
     private readonly prisma: PrismaService,
@@ -490,6 +492,61 @@ export class MemoryService {
     }
   }
 
+  validateSkipCandidate(
+    candidate: MemoryRecord,
+    acceptanceCriteria: string[],
+  ): boolean {
+    if (acceptanceCriteria.length === 0) return true;
+
+    const content = candidate.content.toLowerCase();
+
+    const criteriaMet = acceptanceCriteria.filter((criterion) => {
+      const lower = criterion.toLowerCase();
+      const keywords = lower
+        .split(/\s+/)
+        .filter((w) => w.length > 3)
+        .slice(0, 5);
+
+      return keywords.some((keyword) => content.includes(keyword));
+    });
+
+    const passRate = criteriaMet.length / acceptanceCriteria.length;
+    if (passRate < 0.5) {
+      this.logger.warn(
+        `Skip candidate failed acceptance validation: ${criteriaMet.length}/${acceptanceCriteria.length} criteria met (${(passRate * 100).toFixed(0)}%)`,
+      );
+      return false;
+    }
+
+    return true;
+  }
+
+  async pruneExpiredMemories(): Promise<number> {
+    try {
+      const result = await this.prisma.$executeRaw`
+        DELETE FROM memory.agent_memories
+        WHERE "expiresAt" IS NOT NULL AND "expiresAt" < NOW()
+      `;
+      this.logger.log(`Pruned ${result} expired memories`);
+      return result;
+    } catch (error) {
+      this.logger.warn(`Failed to prune expired memories: ${this.errorMessage(error)}`);
+      return 0;
+    }
+  }
+
+  async bumpUsageStats(memoryId: string): Promise<void> {
+    try {
+      await this.prisma.$executeRaw`
+        UPDATE memory.agent_memories
+        SET "lastUsedAt" = NOW(), "usageCount" = COALESCE("usageCount", 0) + 1
+        WHERE id = ${memoryId}
+      `;
+    } catch (error) {
+      this.logger.warn(`Failed to bump usage for ${memoryId}: ${this.errorMessage(error)}`);
+    }
+  }
+
   // Internal
 
   private async queryMemories(query: string, where: Prisma.Sql, topK: number): Promise<MemoryRecord[]> {
@@ -548,6 +605,11 @@ export class MemoryService {
       const vector = await this.embedding.embed(input.content);
       const vectorSql = EmbeddingService.toSql(vector);
 
+      const ttlDays = input.memoryType === 'MISTAKE'
+        ? MemoryService.MISTAKE_TTL_DAYS
+        : MemoryService.MEMORY_TTL_DAYS;
+      const expiresAt = input.expiresAt ?? new Date(Date.now() + ttlDays * 24 * 60 * 60 * 1000);
+
       await this.prisma.$executeRaw`
         INSERT INTO memory.agent_memories (
           id,
@@ -578,7 +640,7 @@ export class MemoryService {
           ${input.projectId},
           ${input.sourceType ?? null},
           ${input.importance ?? 0.5},
-          ${input.expiresAt ?? null},
+          ${expiresAt},
           ${input.approvedAt ?? null},
           ${input.approvalSource ?? null},
           NOW()

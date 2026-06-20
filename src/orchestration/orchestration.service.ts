@@ -1,4 +1,5 @@
 import {
+  BadRequestException,
   Inject,
   Injectable,
   Logger,
@@ -6,11 +7,12 @@ import {
   Optional,
 } from '@nestjs/common';
 import { createId } from '@paralleldrive/cuid2';
-import { Annotation, END, START, StateGraph, type CompiledStateGraph } from '@langchain/langgraph';
+import { Annotation, END, START, StateGraph, NodeInterrupt, type CompiledStateGraph } from '@langchain/langgraph';
 import type { PostgresSaver } from '@langchain/langgraph-checkpoint-postgres';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import { createCheckpointer } from './graph/checkpointer';
-import { buildDevFlowGraph } from './graph/devflow.graph';
+import { buildDevFlowGraph, buildGraph } from './graph/devflow.graph';
+import { buildSimulationNodeImpls } from './graph/simulation-nodes';
 import { DevFlowStateType } from './graph/devflow.state';
 import { PrismaService } from '../prisma/prisma.service';
 import { RequirementsParserNode } from './nodes/requirements-parser.node';
@@ -31,10 +33,12 @@ import {
 } from '../github/github.service';
 import { AgentProviderRegistry } from './providers/agent-provider.registry';
 import { ArtifactContractValidator } from './providers/artifact-contract.validator';
+import { OutputValidationService } from './output-validation/output-validation.service';
 import {
   GraphLlmProvider,
   GraphLlmProviderVerification,
 } from './providers/graph-llm.provider';
+import { OrchestrationEmitter } from './streaming/orchestration-emitter.service';
 import { AgentProviderMode, AgentProviderStatus } from './providers/agent-provider.types';
 import {
   agentArtifactContractFor,
@@ -78,6 +82,28 @@ export interface OrchestrationStatus {
   error: string | null;
 }
 
+// ─── Mid-run control (Phase 2) ──────────────────────────────────────────────
+
+export type OrchestrationControlAction =
+  | 'pause'
+  | 'resume'
+  | 'cancel'
+  | 'retry_node'
+  | 'skip_node'
+  | 'modify_params';
+
+export interface OrchestrationControlOptions {
+  nodeId?: string;
+  params?: Record<string, unknown>;
+  actorId?: string;
+}
+
+export interface OrchestrationControlResult {
+  accepted: boolean;
+  action: OrchestrationControlAction;
+  status: string;
+}
+
 export interface WorkOrderExecutionResult {
   executionRunId: string;
   artifactId: string;
@@ -115,6 +141,26 @@ const MOCK_NODE = {
   FINALIZE: 'finalize_mock_orchestration',
 } as const;
 const SUPERVISOR_RECOVERY_NODE = 'supervisor_recovery';
+
+/**
+ * Maps a just-completed DevFlow graph node to the coarse project status carried
+ * in `run.status` events. Drives the typed protocol channel without depending on
+ * the scattered legacy emitStatusUpdate calls (kept for back-compat).
+ */
+const NODE_PROJECT_STATUS: Record<string, ProjectStatus> = {
+  parse_requirements: ProjectStatus.NEGOTIATING_CONTRACT,
+  negotiate_contract: ProjectStatus.AWAITING_GATE_1,
+  gate_1_check: ProjectStatus.GENERATING_CODE,
+  frontend_agent: ProjectStatus.GENERATING_CODE,
+  backend_agent: ProjectStatus.GENERATING_CODE,
+  database_agent: ProjectStatus.GENERATING_CODE,
+  architecture_agent: ProjectStatus.GENERATING_CODE,
+  validate_outputs: ProjectStatus.GENERATING_CODE,
+  gate_2_check: ProjectStatus.COMMITTING,
+  commit_to_github: ProjectStatus.COMMITTING,
+  mark_delivered: ProjectStatus.DELIVERED,
+  mark_failed: ProjectStatus.FAILED,
+};
 
 const MockWorkOrderState = Annotation.Root({
   projectId: Annotation<string>(),
@@ -175,12 +221,33 @@ export class OrchestrationService implements OnModuleInit {
     Partial<DevFlowStateType>,
     string
   >;
+  // Phase 3: simulation graph — same topology, deterministic event-rich nodes.
+  private simulationGraph!: CompiledStateGraph<
+    DevFlowStateType,
+    Partial<DevFlowStateType>,
+    string
+  >;
   private mockWorkOrderGraph!: CompiledStateGraph<
     MockWorkOrderStateType,
     Partial<MockWorkOrderStateType>,
     string
   >;
   private checkpointer!: PostgresSaver;
+
+  /**
+   * In-flight runs keyed by runId, each with an AbortController. Created when a
+   * run starts streaming; deleted when it settles. Phase 2 mid-run `cancel`
+   * aborts the controller; Phase 1 only needs the lifecycle bookkeeping.
+   */
+  private readonly activeRuns = new Map<string, AbortController>();
+
+  /**
+   * Projects manually paused via the control API. In-memory by design: pause is
+   * a short-lived interactive operation. While present, the supervisor skips
+   * auto-recovery for the project (manual intervention takes precedence).
+   */
+  private readonly pausedRuns = new Set<string>();
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly requirementsParser: RequirementsParserNode,
@@ -193,6 +260,7 @@ export class OrchestrationService implements OnModuleInit {
     private readonly githubCommit: GithubCommitNode,
     private readonly memory: MemoryService,
     private readonly artifactContractValidator: ArtifactContractValidator,
+    private readonly outputValidation: OutputValidationService,
     private readonly agentProviderRegistry: AgentProviderRegistry,
     private readonly notifications: NotificationsService,
     private readonly github: GithubService,
@@ -200,6 +268,7 @@ export class OrchestrationService implements OnModuleInit {
     private readonly graphLlmProvider: GraphLlmProvider | null,
     // Optional: WebSocket gateway may not be present in all environments
     @Optional() private readonly gateway: DevFlowGateway | null,
+    @Optional() private readonly emitter: OrchestrationEmitter | null,
   ) {}
 
   getProviderStatus(): OrchestrationProviderStatus {
@@ -221,6 +290,112 @@ export class OrchestrationService implements OnModuleInit {
     return this.graphLlmProvider.verifyConnection();
   }
 
+  async autoAnalyzeBrief(input: {
+    companyName: string;
+    brief: string;
+    stackKey: string;
+  }): Promise<{
+    enhancedBrief: string;
+    suggestedFeatures: string[];
+    suggestedTechStack: { frontend: string; backend: string; database: string; styling: string };
+    complexity: 'simple' | 'medium' | 'complex';
+    estimatedFiles: number;
+  }> {
+    if (!this.graphLlmProvider) {
+      throw new BadRequestException(
+        'Auto-analyze requires an LLM provider, but the Graph LLM provider is not available in this runtime. Ensure the OrchestrationModule is properly configured.',
+      );
+    }
+
+    if (!this.graphLlmProvider.isAvailable()) {
+      const keyName =
+        this.graphLlmProvider.providerName() === 'anthropic' ? 'ANTHROPIC_API_KEY' :
+        this.graphLlmProvider.providerName() === 'opencode' ? 'OPENCODE_API_KEY' :
+        this.graphLlmProvider.providerName() === 'gemini' ? 'GEMINI_API_KEY' :
+        this.graphLlmProvider.providerName() === 'openai' ? 'OPENAI_API_KEY' :
+        'OPENROUTER_API_KEY';
+      throw new BadRequestException(
+        `Auto-analyze requires an LLM API key. Set the ${keyName} environment variable, or configure the provider in Admin > Providers.`,
+      );
+    }
+
+    const systemPrompt = `You are a product analyst helping a PM turn a rough idea into a structured project brief.
+Return a valid JSON object with this exact shape:
+{
+  "enhancedBrief": string,
+  "suggestedFeatures": string[],
+  "suggestedTechStack": {
+    "frontend": string,
+    "backend": string,
+    "database": string,
+    "styling": string
+  },
+  "complexity": "simple" | "medium" | "complex",
+  "estimatedFiles": number
+}
+
+Rules:
+- enhancedBrief: Rewrite the rough idea as a clear, professional 2-4 sentence project brief. Preserve the user's intent but add clarity.
+- suggestedFeatures: 4-8 concrete features as short noun phrases (e.g. "User authentication", "Dashboard analytics").
+- suggestedTechStack: Infer from the stack key hint; use sensible defaults if not clear.
+- complexity: "simple" for <4 features, "medium" for 4-7, "complex" for 8+.
+- estimatedFiles: Rough file count based on features and complexity.
+Respond ONLY with the JSON object — no markdown fences, no prose.`;
+
+    const userPrompt = `Analyze this project idea and produce a structured brief.
+
+Company name: ${input.companyName}
+Stack key: ${input.stackKey}
+Rough idea: ${input.brief}`;
+
+    const result = await this.graphLlmProvider.generateJson<Record<string, unknown>>({
+      agentName: 'auto_analyze',
+      systemPrompt,
+      userPrompt,
+      expectedShape: 'object',
+    });
+
+    const value = result.value;
+    const suggestedFeatures = Array.isArray(value['suggestedFeatures'])
+      ? (value['suggestedFeatures'] as unknown[]).filter(
+          (f): f is string => typeof f === 'string' && f.trim().length > 0,
+        )
+      : [];
+
+    const rawTechStack = value['suggestedTechStack'];
+    const techStack =
+      rawTechStack && typeof rawTechStack === 'object' && !Array.isArray(rawTechStack)
+        ? (rawTechStack as Record<string, unknown>)
+        : {};
+
+    const rawComplexity = value['complexity'];
+    const complexity =
+      rawComplexity === 'simple' || rawComplexity === 'medium' || rawComplexity === 'complex'
+        ? rawComplexity
+        : 'medium';
+
+    const estimatedFiles =
+      typeof value['estimatedFiles'] === 'number' && (value['estimatedFiles'] as number) > 0
+        ? Math.ceil(value['estimatedFiles'] as number)
+        : Math.max(suggestedFeatures.length + 6, 8);
+
+    return {
+      enhancedBrief:
+        typeof value['enhancedBrief'] === 'string' && value['enhancedBrief'].trim().length > 0
+          ? value['enhancedBrief'] as string
+          : input.brief,
+      suggestedFeatures: suggestedFeatures.length > 0 ? suggestedFeatures : ['Core application workflow'],
+      suggestedTechStack: {
+        frontend: typeof techStack['frontend'] === 'string' ? techStack['frontend'] : 'Next.js',
+        backend: typeof techStack['backend'] === 'string' ? techStack['backend'] : 'NestJS',
+        database: typeof techStack['database'] === 'string' ? techStack['database'] : 'PostgreSQL',
+        styling: typeof techStack['styling'] === 'string' ? techStack['styling'] : 'Tailwind CSS',
+      },
+      complexity,
+      estimatedFiles,
+    };
+  }
+
   async onModuleInit(): Promise<void> {
     this.logger.log('Initializing orchestration graph...');
     this.checkpointer = await createCheckpointer();
@@ -235,9 +410,86 @@ export class OrchestrationService implements OnModuleInit {
       this.githubCommit,
       this.prisma,
       this.checkpointer,
+      this.emitter,
+    );
+    this.simulationGraph = buildGraph(
+      buildSimulationNodeImpls(this.emitter),
+      this.prisma,
+      this.checkpointer,
+      this.emitter,
     );
     this.mockWorkOrderGraph = this.buildMockWorkOrderGraph();
     this.logger.log('Orchestration graph initialized and compiled');
+  }
+
+  /**
+   * Drives the DevFlow graph via graph.stream() (Phase 1). Consumes streamed
+   * node updates, emitting typed run.status events and persisting currentNode as
+   * each node completes. NodeInterrupt (a gate pause) ends the stream without
+   * throwing — the gate node has already set AWAITING_GATE_* and emitted its
+   * lifecycle. Real errors surface as run.error + markRunFailed. An
+   * AbortController is registered for the run's lifetime so Phase 2 `cancel` can
+   * abort mid-stream.
+   *
+   * Fire-and-forget: callers do `void this.runGraph(...)` to keep returning the
+   * runId immediately, matching the previous graph.invoke().catch() behavior.
+   */
+  private async runGraph(
+    projectId: string,
+    runId: string,
+    config: RunnableConfig & { configurable: { thread_id: string } },
+    input: Partial<DevFlowStateType> | null,
+    graph: CompiledStateGraph<DevFlowStateType, Partial<DevFlowStateType>, string> = this.graph,
+  ): Promise<void> {
+    const controller = new AbortController();
+    this.activeRuns.set(runId, controller);
+
+    try {
+      const stream = await graph.stream(input as Partial<DevFlowStateType>, {
+        ...config,
+        streamMode: 'updates',
+        signal: controller.signal,
+      });
+
+      for await (const update of stream) {
+        if (!update || typeof update !== 'object') continue;
+        for (const nodeName of Object.keys(update)) {
+          const status = NODE_PROJECT_STATUS[nodeName] ?? ProjectStatus.GENERATING_CODE;
+          this.emitter?.runStatus(projectId, runId, status, nodeName);
+          await this.prisma.orchestrationRun
+            .update({ where: { runId }, data: { currentNode: nodeName } })
+            .catch(() => undefined);
+        }
+      }
+    } catch (err) {
+      if (err instanceof NodeInterrupt) {
+        // Expected pause at a gate — not a failure.
+        return;
+      }
+      if (controller.signal.aborted) {
+        // Operator pause/cancel aborted the stream. The control handler already
+        // set the appropriate run state + emitted events; the checkpoint is
+        // intact so the run can resume. Not a failure.
+        this.logger.log(`Graph run ${runId} aborted by operator (pause/cancel).`);
+        return;
+      }
+      const message = err instanceof Error ? err.message : String(err);
+      this.logger.error(
+        `Graph run ${runId} for project ${projectId} encountered an error: ${message}`,
+      );
+      this.emitter?.runError(projectId, runId, {
+        code: 'NODE_FAILED',
+        severity: 'permanent',
+        message,
+      });
+      await this.markRunFailed(runId, 'graph', message);
+    } finally {
+      // Only clear if this controller is still the active one (a resume/retry
+      // may have already registered a new controller for this runId).
+      if (this.activeRuns.get(runId) === controller) {
+        this.activeRuns.delete(runId);
+      }
+    }
   }
 
   /**
@@ -325,6 +577,30 @@ export class OrchestrationService implements OnModuleInit {
       return runId;
     }
 
+    if (this.agentProviderMode() === 'simulation') {
+      // Simulation runs the real-shaped graph with deterministic, event-rich
+      // nodes. Gate approvals are pre-seeded so the run flows hands-free for UI
+      // testing (no human gate steps, no LLM/GitHub access).
+      const simulationInput: Partial<DevFlowStateType> = {
+        projectId,
+        runId,
+        brief,
+        stackKey,
+        companyName,
+        gate1Approved: true,
+        gate2Approved: true,
+      };
+      void this.runGraph(projectId, runId, config, simulationInput, this.simulationGraph);
+      this.gateway?.emitStatusUpdate(projectId, 'PARSING_REQUIREMENTS', 'parse_requirements');
+      this.emitter?.runStatus(
+        projectId,
+        runId,
+        ProjectStatus.PARSING_REQUIREMENTS,
+        'parse_requirements',
+      );
+      return runId;
+    }
+
     const initialInput: Partial<DevFlowStateType> = {
       projectId,
       runId,
@@ -333,18 +609,21 @@ export class OrchestrationService implements OnModuleInit {
       companyName,
     };
 
-    this.graph.invoke(initialInput, config).catch((err: unknown) => {
-      const message = err instanceof Error ? err.message : String(err);
-      this.logger.error(
-        `Graph run ${runId} for project ${projectId} encountered an error: ${message}`,
-      );
-      void this.markRunFailed(runId, 'graph', message);
-    });
+    // Drive the graph via the streaming run loop (Phase 1). Errors are handled
+    // inside runGraph (run.error + markRunFailed); fire-and-forget here.
+    void this.runGraph(projectId, runId, config, initialInput);
 
-    // Notify subscribers that the graph has started and is parsing requirements
+    // Notify subscribers that the graph has started and is parsing requirements.
+    // Legacy event kept for back-compat; runGraph also emits typed run.status.
     this.gateway?.emitStatusUpdate(
       projectId,
       'PARSING_REQUIREMENTS',
+      'parse_requirements',
+    );
+    this.emitter?.runStatus(
+      projectId,
+      runId,
+      ProjectStatus.PARSING_REQUIREMENTS,
       'parse_requirements',
     );
 
@@ -445,13 +724,9 @@ export class OrchestrationService implements OnModuleInit {
 
     // Notify subscribers that code generation has begun after Gate 1 approval
     this.gateway?.emitStatusUpdate(projectId, 'GENERATING_CODE', 'gate_1_check');
+    this.emitter?.runStatus(projectId, runId, ProjectStatus.GENERATING_CODE, 'gate_1_check');
 
-    this.graph.invoke(null, config).catch((err: unknown) => {
-      const message = err instanceof Error ? err.message : String(err);
-      this.logger.error(
-        `Graph resume after gate 1 for project ${projectId} failed: ${message}`,
-      );
-    });
+    void this.runGraph(projectId, runId, config, null);
   }
 
   /**
@@ -598,13 +873,9 @@ export class OrchestrationService implements OnModuleInit {
 
     // Notify subscribers that commit phase has begun after Gate 2 approval
     this.gateway?.emitStatusUpdate(projectId, 'COMMITTING', 'gate_2_check');
+    this.emitter?.runStatus(projectId, runId, ProjectStatus.COMMITTING, 'gate_2_check');
 
-    this.graph.invoke(null, config).catch((err: unknown) => {
-      const message = err instanceof Error ? err.message : String(err);
-      this.logger.error(
-        `Graph resume after gate 2 for project ${projectId} failed: ${message}`,
-      );
-    });
+    void this.runGraph(projectId, runId, config, null);
   }
 
   /**
@@ -810,10 +1081,10 @@ export class OrchestrationService implements OnModuleInit {
         executionRunId,
       };
       const output = await provider.generateWorkOrderOutput(agentContext);
-      const validation = this.artifactContractValidator.validate(output, agentContext);
+      const validation = this.outputValidation.validate(output, agentContext);
 
       if (!validation.valid) {
-        throw new Error(`Artifact contract validation failed: ${validation.errors.join('; ')}`);
+        throw new Error(`Output validation failed: ${validation.errors.map(e => e.message).join('; ')}`);
       }
 
       const artifact = await this.prisma.artifact.create({
@@ -1489,6 +1760,208 @@ export class OrchestrationService implements OnModuleInit {
 
   private requestedAgentProviderMode(): AgentProviderMode {
     return this.agentProviderRegistry.requestedMode();
+  }
+
+  // ─── Mid-run control (Phase 2) ────────────────────────────────────────────
+
+  /**
+   * Whether a project is currently paused (or otherwise manually halted) via the
+   * control API. The supervisor calls this to give manual intervention
+   * precedence over automatic stuck-run recovery.
+   */
+  isManuallyHalted(projectId: string): boolean {
+    return this.pausedRuns.has(projectId);
+  }
+
+  /**
+   * Mid-run control entry point. Routes a control action to its handler. Built
+   * on the same primitives as gate resume — graph.updateState() + re-stream via
+   * runGraph(), plus the per-run AbortController for pause/cancel.
+   */
+  async control(
+    projectId: string,
+    action: OrchestrationControlAction,
+    options: OrchestrationControlOptions = {},
+  ): Promise<OrchestrationControlResult> {
+    const runId = await this.getRunId(projectId);
+    const config = threadConfig(projectId, runId);
+    this.logger.log(`Control '${action}' for project ${projectId} (run ${runId})`);
+
+    switch (action) {
+      case 'cancel':
+        return this.cancelRun(projectId, runId, options.actorId);
+      case 'pause':
+        return this.pauseRun(projectId, runId);
+      case 'resume':
+        return this.resumeRun(projectId, runId, config);
+      case 'retry_node':
+        return this.retryNode(projectId, runId, config, options.nodeId);
+      case 'skip_node':
+        return this.skipNode(projectId, runId, config, options.nodeId);
+      case 'modify_params':
+        return this.modifyParams(projectId, runId, config, options.params);
+      default:
+        throw new BadRequestException(`Unknown control action: ${String(action)}`);
+    }
+  }
+
+  private async cancelRun(
+    projectId: string,
+    runId: string,
+    actorId?: string,
+  ): Promise<OrchestrationControlResult> {
+    this.activeRuns.get(runId)?.abort();
+    this.activeRuns.delete(runId);
+    this.pausedRuns.delete(projectId);
+
+    const now = new Date();
+    const reason = `Cancelled${actorId ? ` by ${actorId}` : ''}`;
+    await Promise.allSettled([
+      this.prisma.orchestrationRun.updateMany({
+        where: { runId, status: OrchestrationRunStatus.RUNNING },
+        data: { status: OrchestrationRunStatus.CANCELLED, error: reason, completedAt: now },
+      }),
+      // ProjectStatus has no CANCELLED — FAILED is the terminal state that
+      // excludes the project from supervisor auto-recovery.
+      this.prisma.project.update({
+        where: { id: projectId },
+        data: { status: ProjectStatus.FAILED },
+      }),
+      this.prisma.workOrder.updateMany({
+        where: { projectId, status: WorkOrderStatus.DISPATCHED },
+        data: { status: WorkOrderStatus.CANCELLED, executionCompletedAt: now, lastEventAt: now },
+      }),
+    ]);
+
+    this.emitter?.runStatus(projectId, runId, 'CANCELLED', 'cancelled');
+    this.emitter?.runError(projectId, runId, {
+      code: 'CANCELLED',
+      severity: 'permanent',
+      message: reason,
+    });
+
+    return { accepted: true, action: 'cancel', status: 'CANCELLED' };
+  }
+
+  private async pauseRun(
+    projectId: string,
+    runId: string,
+  ): Promise<OrchestrationControlResult> {
+    this.pausedRuns.add(projectId);
+    // Abort the in-flight stream. The LangGraph checkpoint is written after each
+    // node, so only in-flight node(s) are lost; resume re-streams from the
+    // checkpoint. runGraph treats the abort as non-fatal.
+    this.activeRuns.get(runId)?.abort();
+    this.activeRuns.delete(runId);
+
+    this.emitter?.runStatus(projectId, runId, 'PAUSED', 'paused');
+    return { accepted: true, action: 'pause', status: 'PAUSED' };
+  }
+
+  private async resumeRun(
+    projectId: string,
+    runId: string,
+    config: RunnableConfig & { configurable: { thread_id: string } },
+  ): Promise<OrchestrationControlResult> {
+    const run = await this.prisma.orchestrationRun.findUnique({
+      where: { runId },
+      select: { status: true },
+    });
+    if (run?.status === OrchestrationRunStatus.CANCELLED) {
+      throw new BadRequestException('Run was cancelled and cannot be resumed');
+    }
+
+    this.pausedRuns.delete(projectId);
+    this.emitter?.runStatus(projectId, runId, ProjectStatus.GENERATING_CODE, 'resumed');
+    void this.runGraph(projectId, runId, config, null);
+    return { accepted: true, action: 'resume', status: 'RUNNING' };
+  }
+
+  private async retryNode(
+    projectId: string,
+    runId: string,
+    config: RunnableConfig & { configurable: { thread_id: string } },
+    nodeId?: string,
+  ): Promise<OrchestrationControlResult> {
+    // Clear the error and reset the retry counter so the graph re-enters the
+    // failed step from the last checkpoint. Precise per-node re-routing lands in
+    // Phase 3 with the node-factory refactor (asNode targeting).
+    await this.graph.updateState(config, { error: null, retryCount: 0 });
+    await this.prisma.orchestrationRun.updateMany({
+      where: { runId },
+      data: { status: OrchestrationRunStatus.RUNNING, error: null, completedAt: null },
+    });
+
+    this.pausedRuns.delete(projectId);
+    this.emitter?.runStatus(
+      projectId,
+      runId,
+      ProjectStatus.GENERATING_CODE,
+      nodeId ?? 'retry',
+    );
+    void this.runGraph(projectId, runId, config, null);
+    return { accepted: true, action: 'retry_node', status: 'RUNNING' };
+  }
+
+  private async skipNode(
+    projectId: string,
+    runId: string,
+    config: RunnableConfig & { configurable: { thread_id: string } },
+    nodeId?: string,
+  ): Promise<OrchestrationControlResult> {
+    if (!nodeId) {
+      throw new BadRequestException('skip_node requires a nodeId');
+    }
+    // Write state "as" the node with no changes so the graph routes past it via
+    // that node's outgoing edges (LangGraph updateState asNode form).
+    await this.graph.updateState(config, { error: null }, nodeId);
+
+    this.pausedRuns.delete(projectId);
+    this.emitter?.nodeLifecycle(projectId, runId, nodeId, 'skipped');
+    this.emitter?.runStatus(projectId, runId, ProjectStatus.GENERATING_CODE, nodeId);
+    void this.runGraph(projectId, runId, config, null);
+    return { accepted: true, action: 'skip_node', status: 'RUNNING' };
+  }
+
+  private async modifyParams(
+    projectId: string,
+    runId: string,
+    config: RunnableConfig & { configurable: { thread_id: string } },
+    params?: Record<string, unknown>,
+  ): Promise<OrchestrationControlResult> {
+    if (!params || typeof params !== 'object') {
+      throw new BadRequestException('modify_params requires a params object');
+    }
+
+    // Whitelist graph-state fields that are safe to patch mid-run.
+    const patch: Partial<DevFlowStateType> = {};
+    if (typeof params.retryCount === 'number') patch.retryCount = params.retryCount;
+    if (typeof params.brief === 'string') patch.brief = params.brief;
+    if (typeof params.gate1Notes === 'string') patch.gate1Notes = params.gate1Notes;
+    if (typeof params.gate2Notes === 'string') patch.gate2Notes = params.gate2Notes;
+
+    // Budget knobs live on RunBudget, not graph state.
+    const budgetPatch: { tokenBudget?: number; maxRetries?: number } = {};
+    if (typeof params.tokenBudget === 'number') budgetPatch.tokenBudget = params.tokenBudget;
+    if (typeof params.maxRetries === 'number') budgetPatch.maxRetries = params.maxRetries;
+
+    if (Object.keys(patch).length === 0 && Object.keys(budgetPatch).length === 0) {
+      throw new BadRequestException(
+        'No modifiable parameters provided (allowed: retryCount, brief, gate1Notes, gate2Notes, tokenBudget, maxRetries)',
+      );
+    }
+
+    await Promise.allSettled([
+      Object.keys(patch).length > 0
+        ? this.graph.updateState(config, patch)
+        : Promise.resolve(),
+      Object.keys(budgetPatch).length > 0
+        ? this.prisma.runBudget.update({ where: { projectId }, data: budgetPatch })
+        : Promise.resolve(),
+    ]);
+
+    this.emitter?.runStatus(projectId, runId, 'PARAMS_UPDATED', 'modify_params');
+    return { accepted: true, action: 'modify_params', status: 'RUNNING' };
   }
 
   private async getRunId(projectId: string): Promise<string> {

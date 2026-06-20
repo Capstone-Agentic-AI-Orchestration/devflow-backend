@@ -54,6 +54,8 @@ function makeEventLogMock() {
 
 function makeOrchestrationMock() {
   return {
+    // Phase 2: supervisor checks this to give manual intervention precedence.
+    isManuallyHalted: vi.fn().mockReturnValue(false),
     recoverStaleProject: vi.fn().mockResolvedValue({
       runId: 'recovery-run-1',
       readyWorkOrders: 1,
@@ -105,6 +107,28 @@ describe('RunSupervisorService', () => {
     expect(generatingCode).toBe(ProjectStatus.GENERATING_CODE);
     expect(committing).toBe(ProjectStatus.COMMITTING);
     expect(threshold).toBeInstanceOf(Date);
+  });
+
+  it('skips auto-recovery for a manually paused (halted) project', async () => {
+    prisma.$queryRaw.mockResolvedValue([
+      {
+        id: 'project-paused',
+        status: ProjectStatus.GENERATING_CODE,
+        retryCount: 0,
+        maxRetries: 3,
+        tokensConsumed: 100,
+        tokenBudget: 1000,
+      },
+    ]);
+    orchestration.isManuallyHalted.mockReturnValue(true);
+
+    await service.supervisorTick();
+
+    expect(orchestration.isManuallyHalted).toHaveBeenCalledWith('project-paused');
+    // Manual intervention wins: no retry bump, no STUCK log, no recovery run.
+    expect(prisma.runBudget.update).not.toHaveBeenCalled();
+    expect(eventLog.logStuck).not.toHaveBeenCalled();
+    expect(orchestration.recoverStaleProject).not.toHaveBeenCalled();
   });
 
   it('requeues stale dispatched work orders and fails running runtime rows while retry budget remains', async () => {

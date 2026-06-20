@@ -1,4 +1,5 @@
 import { Injectable, Logger } from '@nestjs/common';
+import { WorkOrderAgentType } from '@prisma/client';
 import { DevFlowStateType, GeneratedArtifact } from '../graph/devflow.state';
 import { MemoryService } from '../../memory/memory.service';
 import { EventLogService } from '../../supervisor/event-log.service';
@@ -6,16 +7,9 @@ import { GraphLlmProvider } from '../providers/graph-llm.provider';
 import { PrismaService } from '../../prisma/prisma.service';
 import { StreamEmitter } from '../streaming/stream-emitter.service';
 import { humanReadableError } from './human-readable-error';
-
-// ─── Constants ────────────────────────────────────────────────────────────────
-
-const SYSTEM_PROMPT = `You are a senior NestJS backend engineer generating production-quality TypeScript code.
-Generate complete, working NestJS files with proper decorators, dependency injection, and type safety.
-Respond ONLY with a JSON array — no prose, no markdown fences.
-
-Each element: { "filePath": string, "content": string, "language": string }`;
-
-// ─── Node ─────────────────────────────────────────────────────────────────────
+import { BACKEND_AGENT_SYSTEM, buildAgentSystemPrompt } from '../prompts/agent-prompts';
+import { resolveModelForNode } from '../providers/base-llm.provider';
+import { ProjectScaffolderService } from '../scaffolding/project-scaffolder.service';
 
 @Injectable()
 export class BackendAgentNode {
@@ -27,6 +21,7 @@ export class BackendAgentNode {
     private readonly eventLog: EventLogService,
     private readonly graphLlm: GraphLlmProvider,
     private readonly streamEmitter: StreamEmitter,
+    private readonly scaffolder: ProjectScaffolderService,
   ) {}
 
   async execute(
@@ -40,15 +35,11 @@ export class BackendAgentNode {
       return { error: 'BackendAgentNode: contract is null' };
     }
 
-    // Log STARTED — allSettled inside, so failure here does not block the node.
     await this.eventLog.logStarted(projectId, 'backend_agent');
 
     this.streamEmitter.emit(projectId, 'backend_agent', runId ?? '', 'decision', 'Starting backend code generation...');
 
     try {
-      // ── 1. Read relevant memories before LLM call ──────────────────────────
-      // companyName is included so domain-specific backend patterns (e.g.
-      // "fintech NestJS CQRS") surface alongside the stack and feature context.
       const memoryQuery = [
         state.contract.requirements.projectType,
         state.stackKey,
@@ -67,7 +58,6 @@ export class BackendAgentNode {
 
       this.streamEmitter.emit(projectId, 'backend_agent', runId ?? '', 'decision', `Loaded ${memoryBundle.total} memory references for backend context`);
 
-      // ── 2. Build file list ───────────────────────────────────────────────
       const backendFiles = state.contract.fileManifest.filter((f) =>
         /\.(module|controller|service|dto|guard|pipe|interceptor)\.ts$|README-backend\.md$/i.test(f),
       );
@@ -85,9 +75,6 @@ export class BackendAgentNode {
         ...new Set([...coreFiles, ...backendFiles]),
       ];
 
-      // ── 2. Skip-generation check ───────────────────────────────────────────
-      // Must run AFTER readRelevant so memory context is still available if the
-      // skip threshold is not met. Returns immediately — no LLM tokens consumed.
       const skipCandidate = await this.memory.findSkipCandidate(
         'backend',
         memoryQuery,
@@ -96,52 +83,74 @@ export class BackendAgentNode {
       );
 
       if (skipCandidate) {
-        this.logger.log(
-          `[${state.projectId}] Skip-generation: reusing backend memory artifact (similarity=${skipCandidate.similarity?.toFixed(3)})`,
+        const isValid = this.memory.validateSkipCandidate(
+          skipCandidate,
+          state.contract.acceptanceCriteria,
         );
-        const rememberedFilePath = skipCandidate.metadata['filePath'];
-        const artifact: GeneratedArtifact = {
-          agentType: 'backend',
-          filePath:
-            typeof rememberedFilePath === 'string'
-              ? rememberedFilePath
-              : 'src/generated/artifact.ts',
-          content: skipCandidate.content,
-          language: 'typescript',
-        };
-        return { artifacts: this.completeArtifacts(allBackendFiles, [artifact], state) };
+        if (isValid) {
+          this.logger.log(
+            `[${state.projectId}] Skip-generation: reusing backend memory artifact (similarity=${skipCandidate.similarity?.toFixed(3)})`,
+          );
+          await this.memory.bumpUsageStats(skipCandidate.id);
+          const rememberedFilePath = skipCandidate.metadata['filePath'];
+          const artifact: GeneratedArtifact = {
+            agentType: 'backend',
+            filePath:
+              typeof rememberedFilePath === 'string'
+                ? rememberedFilePath
+                : 'src/generated/artifact.ts',
+            content: skipCandidate.content,
+            language: 'typescript',
+            source: 'skip',
+          };
+          return { artifacts: this.mergeWithScaffold([artifact], state), validationFeedback: null };
+
+        }
+        this.logger.log(
+          `[${state.projectId}] Skip candidate failed acceptance validation, proceeding with LLM generation`,
+        );
       }
 
       if (process.env.MOCK_MODE === 'true') {
         this.streamEmitter.emit(projectId, 'backend_agent', runId ?? '', 'decision', 'Mock mode: generating predefined backend files');
-        const artifacts = this.completeArtifacts(
-          allBackendFiles,
-          [
+        const mockArtifacts: GeneratedArtifact[] = [
           {
             agentType: 'backend',
             filePath: 'src/main.ts',
             content: `export function bootstrap() {\n  console.log("Mock Backend Running!");\n}`,
-            language: 'typescript'
-          }
-          ],
-          state,
-        );
+            language: 'typescript',
+            source: 'mock',
+          },
+        ];
+        const artifacts = this.mergeWithScaffold(mockArtifacts, state);
         await this.eventLog.logCompleted(state.projectId, 'backend_agent', { inputTokens: 0, outputTokens: 0, model: 'mock' });
-        return { artifacts };
+        return { artifacts, validationFeedback: null };
       }
-
       this.streamEmitter.emit(projectId, 'backend_agent', runId ?? '', 'decision', `Calling LLM (${this.graphLlm.model()}) to generate backend code for ${allBackendFiles.length} files...`);
 
-      // ── 4. LLM call ───────────────────────────────────────────────────────
+      const artifactManifest = (state.artifacts ?? [])
+        .map((a) => `${a.agentType}: ${a.filePath}`)
+        .join('\n');
+
+      const feedbackContext = state.validationFeedback
+        ? `Your previous attempt had these validation issues. Fix them in your new output:\n${state.validationFeedback}`
+        : '';
+
+      const systemPrompt = buildAgentSystemPrompt(
+        BACKEND_AGENT_SYSTEM,
+        memoryContext,
+        artifactManifest,
+        feedbackContext,
+      );
+
       const result = await this.graphLlm.generateJson<Array<{
         filePath: string;
         content: string;
         language?: string;
       }>>({
-        agentName: 'backend_agent',
-        systemPrompt: memoryContext
-          ? `${SYSTEM_PROMPT}\n\nRelevant memory:\n${memoryContext}`
-          : SYSTEM_PROMPT,
+        agentName: resolveModelForNode('backend_agent', 'backend_agent'),
+        onToken: (delta) => this.streamEmitter.emit(projectId, 'backend_agent', runId ?? '', 'token', delta),
+        systemPrompt,
         userPrompt: `Generate NestJS backend files for this project:
 
 Project: ${state.contract.projectName}
@@ -158,114 +167,30 @@ Generate complete NestJS code with:
 - Full CRUD operations where applicable
 - Zod-validated DTOs
 - Swagger/OpenAPI decorators where appropriate
-- For README-backend.md: include API documentation, setup guide, and architecture notes`,
+- Config files (package.json, tsconfig.json, nest-cli.json, tsconfig.build.json, README-backend.md) will be provided automatically — do not include them in your output`,
         expectedShape: 'array',
       });
 
-      const artifacts = this.completeArtifacts(
-        allBackendFiles,
-        result.value.map((item) => ({
-          agentType: 'backend' as const,
-          filePath: item.filePath,
-          content: item.content,
-          language: item.language ?? this.inferLanguage(item.filePath),
-        })),
-        state,
-      );
+      const llmArtifacts: GeneratedArtifact[] = result.value.map((item) => ({
+        agentType: 'backend' as const,
+        filePath: item.filePath,
+        content: item.content,
+        language: item.language ?? this.inferLanguage(item.filePath),
+        source: 'llm',
+      }));
+
+      const artifacts = this.mergeWithScaffold(llmArtifacts, state);
 
       this.logger.log(
         `[${state.projectId}] Backend agent generated ${artifacts.length} files (${memoryBundle.total} layered memories injected)`,
       );
 
-      // ── 5. Inject bootstrapping configs ────────────────────────────────────
-      const projectName = state.contract.projectName.replace(/[^a-z0-9-]/gi, '-').toLowerCase();
-      const configFiles: GeneratedArtifact[] = [
-        {
-          agentType: 'backend',
-          filePath: 'nest-cli.json',
-          content: JSON.stringify({
-            $schema: 'https://json.schemastore.org/nest-cli',
-            collection: '@nestjs/schematics',
-            sourceRoot: 'src',
-          }, null, 2),
-          language: 'json',
-        },
-        {
-          agentType: 'backend',
-          filePath: 'tsconfig.build.json',
-          content: JSON.stringify({
-            extends: './tsconfig.json',
-            exclude: ['node_modules', 'test', 'dist', '**/*spec.ts'],
-          }, null, 2),
-          language: 'json',
-        },
-      ];
-      for (const cfg of configFiles) {
-        const idx = artifacts.findIndex((a) => a.filePath === cfg.filePath);
-        if (idx >= 0) artifacts[idx] = cfg;
-        else artifacts.push(cfg);
-      }
-
-      // ── 6. Override README-backend.md ──────────────────────────────────────
-      const readmeIdx = artifacts.findIndex((a) => a.filePath === 'README-backend.md');
-      if (readmeIdx >= 0) {
-        artifacts[readmeIdx].content = `# ${state.contract.projectName} — Backend
-
-Generated by DevFlow.
-
-## Quick start
-
-\`\`\`bash
-npm install
-npm run start:dev
-\`\`\`
-
-The API listens on http://localhost:4001 by default.
-
-## Project structure
-
-\`\`\`
-.
-├── src/
-│   ├── main.ts                     # Application entrypoint
-│   ├── app.module.ts               # Root module
-│   └── modules/
-│       └── core/
-│           ├── core.module.ts
-│           ├── core.controller.ts
-│           ├── core.service.ts
-│           └── dto/
-│               └── create-item.dto.ts
-├── nest-cli.json
-├── tsconfig.build.json
-├── package.json
-└── README-backend.md
-\`\`\`
-
-## Available scripts
-
-| Command | Description |
-|---------|-------------|
-| \`npm run start:dev\` | Hot-reload development |
-| \`npm run build\` | Production build |
-| \`npm run start\` | Start production server |
-
-## Tech stack
-
-- **Framework:** NestJS 10
-- **Language:** TypeScript
-- **Database:** PostgreSQL via Prisma
-`;
-      }
-
-      // Log COMPLETED with cost metadata — budget is updated atomically inside.
       await this.eventLog.logCompleted(state.projectId, 'backend_agent', {
         inputTokens: result.usage.inputTokens,
         outputTokens: result.usage.outputTokens,
         model: result.model,
       });
 
-      // Persist artifacts to DB immediately so the frontend sees them
       await this.prisma.artifact.createMany({
         data: artifacts.map((a: GeneratedArtifact) => ({
           projectId: state.projectId,
@@ -273,6 +198,7 @@ The API listens on http://localhost:4001 by default.
           filePath: a.filePath,
           content: a.content,
           language: a.language,
+          source: a.source ?? 'llm',
         })),
         skipDuplicates: true,
       }).catch((err: unknown) => {
@@ -281,7 +207,7 @@ The API listens on http://localhost:4001 by default.
 
       this.streamEmitter.emit(projectId, 'backend_agent', runId ?? '', 'decision', `Backend generation complete: ${artifacts.length} files generated (${result.usage.outputTokens} output tokens)`);
 
-      return { artifacts };
+      return { artifacts, validationFeedback: null };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       this.logger.error(`[${state.projectId}] Backend agent failed: ${message}`);
@@ -290,169 +216,17 @@ The API listens on http://localhost:4001 by default.
     }
   }
 
-  private completeArtifacts(
-    requestedFiles: string[],
-    generated: GeneratedArtifact[],
+  private mergeWithScaffold(
+    llmArtifacts: GeneratedArtifact[],
     state: DevFlowStateType,
   ): GeneratedArtifact[] {
-    const byPath = new Map(generated.map((artifact) => [artifact.filePath, artifact]));
-
-    return requestedFiles.map((filePath) => {
-      const artifact = byPath.get(filePath);
-      if (artifact?.content?.trim()) return artifact;
-
-      return {
-        agentType: 'backend' as const,
-        filePath,
-        content: this.fallbackContent(filePath, state),
-        language: this.inferLanguage(filePath),
-      };
+    const scaffoldFiles = this.scaffolder.scaffold({
+      projectId: state.projectId,
+      agentType: WorkOrderAgentType.BACKEND,
+      contract: state.contract!,
+      companyName: state.companyName,
     });
-  }
-
-  private fallbackContent(filePath: string, state: DevFlowStateType): string {
-    const projectName = state.contract?.projectName ?? state.companyName;
-
-    if (filePath === 'src/app.module.ts') {
-      return `import { Module } from '@nestjs/common';
-import { CoreModule } from './modules/core/core.module';
-
-@Module({
-  imports: [CoreModule],
-})
-export class AppModule {}
-`;
-    }
-
-    if (filePath === 'src/main.ts') {
-      return `import { NestFactory } from '@nestjs/core';
-import { AppModule } from './app.module';
-
-async function bootstrap() {
-  const app = await NestFactory.create(AppModule);
-  app.enableCors();
-  await app.listen(process.env.PORT ?? 3000);
-}
-
-void bootstrap();
-`;
-    }
-
-    if (filePath.endsWith('core.module.ts')) {
-      return `import { Module } from '@nestjs/common';
-import { CoreController } from './core.controller';
-import { CoreService } from './core.service';
-
-@Module({
-  controllers: [CoreController],
-  providers: [CoreService],
-})
-export class CoreModule {}
-`;
-    }
-
-    if (filePath.endsWith('core.controller.ts')) {
-      return `import { Body, Controller, Get, Post } from '@nestjs/common';
-import { CoreService } from './core.service';
-import { CreateItemDto } from './dto/create-item.dto';
-
-@Controller('tasks')
-export class CoreController {
-  constructor(private readonly coreService: CoreService) {}
-
-  @Get()
-  findAll() {
-    return this.coreService.findAll();
-  }
-
-  @Post()
-  create(@Body() dto: CreateItemDto) {
-    return this.coreService.create(dto);
-  }
-}
-`;
-    }
-
-    if (filePath.endsWith('core.service.ts')) {
-      return `import { Injectable } from '@nestjs/common';
-import { CreateItemDto } from './dto/create-item.dto';
-
-@Injectable()
-export class CoreService {
-  private readonly tasks = [{ id: 'task-1', title: 'Review generated project', completed: false }];
-
-  findAll() {
-    return this.tasks;
-  }
-
-  create(dto: CreateItemDto) {
-    const task = { id: \`task-\${this.tasks.length + 1}\`, title: dto.title, completed: false };
-    this.tasks.push(task);
-    return task;
-  }
-}
-`;
-    }
-
-    if (filePath.endsWith('.dto.ts')) {
-      return `export class CreateItemDto {
-  title!: string;
-  description?: string;
-}
-`;
-    }
-
-    if (filePath.endsWith('.module.ts')) {
-      return `import { Module } from '@nestjs/common';
-
-@Module({})
-export class GeneratedModule {}
-`;
-    }
-
-    if (filePath.endsWith('.controller.ts')) {
-      return `import { Controller, Get } from '@nestjs/common';
-
-@Controller()
-export class GeneratedController {
-  @Get('health')
-  health() {
-    return { status: 'ok', project: '${projectName}' };
-  }
-}
-`;
-    }
-
-    if (filePath.endsWith('.service.ts')) {
-      return `import { Injectable } from '@nestjs/common';
-
-@Injectable()
-export class GeneratedService {
-  getStatus() {
-    return { status: 'ready', project: '${projectName}' };
-  }
-}
-`;
-    }
-
-    if (filePath.endsWith('.md')) {
-      return `# Backend
-
-This NestJS backend was generated for ${projectName}.
-
-## Endpoints
-
-- \`GET /tasks\` returns generated task data.
-- \`POST /tasks\` creates a task payload.
-
-## Setup
-
-Install dependencies, configure the database URL, and run the NestJS server.
-`;
-    }
-
-    return `export const generatedBackendFile = '${projectName}';
-`;
+    return this.scaffolder.merge(llmArtifacts, scaffoldFiles, 'backend');
   }
 
   private inferLanguage(filePath: string): string {

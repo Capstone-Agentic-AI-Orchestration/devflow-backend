@@ -1,20 +1,25 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { DevFlowStateType } from '../graph/devflow.state';
+import { DevFlowStateType, RetryDirective } from '../graph/devflow.state';
 import { MemoryService } from '../../memory/memory.service';
 import { StreamEmitter } from '../streaming/stream-emitter.service';
 import { humanReadableError } from './human-readable-error';
+import { OutputValidationService } from '../output-validation/output-validation.service';
+import type { ValidationError } from '../output-validation/schemas/schema.types';
 
-// ─── Validation Result ────────────────────────────────────────────────────────
+type AgentType = 'frontend' | 'backend' | 'database' | 'architecture';
 
 interface ValidationResult {
   valid: boolean;
   missingFiles: string[];
   syntaxIssues: string[];
+  typeIssues: string[];
   schemaIssues: string[];
-  failingAgent: 'frontend' | 'backend' | 'database' | 'architecture' | null;
+  contractIssues: string[];
+  /** Cross-artifact integration violations (frontend↔backend↔database). */
+  integrationIssues: string[];
+  /** Every failing issue grouped under the agent responsible for fixing it. */
+  agentIssues: Map<AgentType, string[]>;
 }
-
-// ─── Node ─────────────────────────────────────────────────────────────────────
 
 @Injectable()
 export class ValidatorNode {
@@ -24,6 +29,7 @@ export class ValidatorNode {
   constructor(
     private readonly memory: MemoryService,
     private readonly streamEmitter: StreamEmitter,
+    private readonly outputValidation: OutputValidationService,
   ) {}
 
   async execute(
@@ -52,36 +58,32 @@ export class ValidatorNode {
       }
 
       this.logger.warn(
-        `[${state.projectId}] Validation failed: missing=${result.missingFiles.length}, syntax=${result.syntaxIssues.length}, schema=${result.schemaIssues.length}`,
+        `[${state.projectId}] Validation failed: missing=${result.missingFiles.length}, syntax=${result.syntaxIssues.length}, type=${result.typeIssues.length}, schema=${result.schemaIssues.length}, integration=${result.integrationIssues.length}, contract=${result.contractIssues.length}`,
       );
 
-      this.streamEmitter.emit(projectId, 'validator', runId ?? '', 'decision', `Validation failed: ${result.missingFiles.length} missing files, ${result.syntaxIssues.length} syntax issues, ${result.schemaIssues.length} schema issues`);
+      this.streamEmitter.emit(projectId, 'validator', runId ?? '', 'decision', `Validation failed: ${result.missingFiles.length} missing files, ${result.syntaxIssues.length} syntax issues, ${result.typeIssues.length} type issues, ${result.schemaIssues.length} schema issues, ${result.integrationIssues.length} integration issues, ${result.contractIssues.length} contract issues`);
 
-      // ── Write validation errors as MISTAKE memories for each affected agent ─
-      // These records teach future runs which patterns led to validator failures,
-      // reducing the likelihood of the same structural errors recurring.
       const validationIssueText = [
         ...result.missingFiles.map((f) => `MISSING FILE: ${f}`),
         ...result.syntaxIssues.map((s) => `SYNTAX: ${s}`),
+        ...result.typeIssues.map((s) => `TYPE: ${s}`),
         ...result.schemaIssues.map((s) => `SCHEMA: ${s}`),
+        ...result.integrationIssues.map((s) => `INTEGRATION: ${s}`),
+        ...result.contractIssues.map((s) => `CONTRACT: ${s}`),
       ].join('\n');
 
-      // Determine which agent types were implicated in the failure
-      const impliedAgents: Set<string> = new Set();
-      if (result.failingAgent) {
-        impliedAgents.add(result.failingAgent);
-      }
-      // Additional cross-agent attribution based on file types
-      if (result.syntaxIssues.length > 0) impliedAgents.add('backend');
-      if (result.schemaIssues.length > 0) impliedAgents.add('database');
+      // Each failing agent gets feedback scoped to its own issues; this also
+      // drives which agents are re-run and which mistakes are remembered.
+      const retryPlan = this.buildRetryPlan(result, validationIssueText);
+      const impliedAgents = retryPlan.map((d) => d.agentType);
 
       const stackKey = state.stackKey ?? 'unknown';
       await Promise.allSettled(
-        Array.from(impliedAgents).map((agentType) =>
+        retryPlan.map((directive) =>
           this.memory.writeMistake({
-            agentType,
-            rejectedContent: validationIssueText,
-            rejectionNotes: `Validator rejected output at retry ${state.retryCount}: ${validationIssueText.slice(0, 300)}`,
+            agentType: directive.agentType,
+            rejectedContent: directive.feedback,
+            rejectionNotes: `Validator rejected ${directive.agentType} output at retry ${state.retryCount}: ${directive.feedback.slice(0, 300)}`,
             projectId: state.projectId,
             gateType: 'GATE_2',
             stackKey,
@@ -94,16 +96,15 @@ export class ValidatorNode {
       if (state.retryCount < ValidatorNode.MAX_RETRIES - 1) {
         const nextRetry = state.retryCount + 1;
         this.logger.log(
-          `[${state.projectId}] Scheduling retry ${nextRetry} for agent: ${result.failingAgent ?? 'unknown'}`,
+          `[${state.projectId}] Scheduling retry ${nextRetry} for agents: ${impliedAgents.join(', ') || 'frontend'}`,
         );
-        // Use RETRY: prefix so the graph router can distinguish from a terminal error
         return {
           retryCount: nextRetry,
-          error: `RETRY:${result.failingAgent ?? 'frontend'}`,
+          retryPlan,
+          error: null,
         };
       }
 
-      // Max retries reached — surface as a warning and continue to gate 2
       this.logger.warn(
         `[${state.projectId}] Max retries reached, proceeding with partial validation`,
       );
@@ -111,8 +112,12 @@ export class ValidatorNode {
         error: `Validation exceeded max retries. Issues: ${[
           ...result.missingFiles.map((f) => `missing:${f}`),
           ...result.syntaxIssues,
+          ...result.typeIssues,
           ...result.schemaIssues,
+          ...result.integrationIssues,
+          ...result.contractIssues,
         ].join('; ')}`,
+        retryPlan: [],
         retryCount: state.retryCount,
       };
     } catch (error) {
@@ -129,108 +134,184 @@ export class ValidatorNode {
         valid: true,
         missingFiles: [],
         syntaxIssues: [],
+        typeIssues: [],
         schemaIssues: [],
-        failingAgent: null
+        contractIssues: [],
+        integrationIssues: [],
+        agentIssues: new Map(),
       };
     }
 
     const contract = state.contract!;
     const generatedPaths = new Set(state.artifacts.map((a) => a.filePath));
 
-    // Check 1: All manifest files present
     const missingFiles = contract.fileManifest.filter(
       (f) => !generatedPaths.has(f),
     );
 
-    // Check 2: Basic TypeScript syntax issues (regex-based, no tsc)
-    const syntaxIssues: string[] = [];
-    const tsArtifacts = state.artifacts.filter((a) =>
-      a.filePath.endsWith('.ts') || a.filePath.endsWith('.tsx'),
-    );
-    for (const artifact of tsArtifacts) {
-      const issues = this.checkBasicTsSyntax(artifact.filePath, artifact.content);
-      syntaxIssues.push(...issues);
-    }
+    // Run real syntax + type-aware checks via OutputValidationService
+    const validationErrors = this.outputValidation.validateBatch(state.artifacts, state.projectId);
+    const syntaxIssues = validationErrors
+      .filter((e) => e.code === 'TS_SYNTAX' || e.code === 'SQL_SYNTAX' || e.code === 'MD_SYNTAX')
+      .map((e) => e.message);
+    const typeIssues = validationErrors
+      .filter((e) => e.code === 'TS_TYPE')
+      .map((e) => `${e.path ? `${e.path}: ` : ''}${e.message}`);
+    const schemaIssues = validationErrors
+      .filter((e) => e.code === 'SCHEMA_VIOLATION' || e.code === 'BASE')
+      .map((e) => `${e.path ? `${e.path}: ` : ''}${e.message}`);
+    const integrationIssues = validationErrors
+      .filter((e) => e.code === 'CONTRACT')
+      .map((e) => `${e.path ? `${e.path}: ` : ''}${e.message}`);
 
-    // Check 3: Prisma schema conflicts
-    const schemaIssues: string[] = [];
-    const prismaArtifact = state.artifacts.find((a) =>
-      a.filePath.endsWith('.prisma'),
-    );
-    if (prismaArtifact) {
-      schemaIssues.push(...this.checkPrismaSchema(prismaArtifact.content));
+    const contractIssues: string[] = [];
+    if (contract.acceptanceCriteria.length > 0) {
+      contractIssues.push(...this.checkAcceptanceCriteria(state));
     }
 
     const valid =
       missingFiles.length === 0 &&
       syntaxIssues.length === 0 &&
-      schemaIssues.length === 0;
+      typeIssues.length === 0 &&
+      schemaIssues.length === 0 &&
+      integrationIssues.length === 0 &&
+      contractIssues.length === 0;
 
-    // Identify which agent is responsible for failures
-    let failingAgent: ValidationResult['failingAgent'] = null;
-    if (!valid) {
-      if (missingFiles.some((f) => /\.(tsx|jsx|css)$/.test(f))) {
-        failingAgent = 'frontend';
-      } else if (missingFiles.some((f) => /\.(module|controller|service)\.ts$/.test(f))) {
-        failingAgent = 'backend';
-      } else if (missingFiles.some((f) => /\.(prisma|sql)$/.test(f)) || schemaIssues.length > 0) {
-        failingAgent = 'database';
-      } else if (missingFiles.some((f) => /\.(md)$/.test(f))) {
-        failingAgent = 'architecture';
-      } else if (syntaxIssues.length > 0) {
-        failingAgent = 'backend';
-      }
-    }
+    const agentIssues = valid
+      ? new Map<AgentType, string[]>()
+      : this.groupIssuesByAgent(validationErrors, missingFiles, contractIssues);
 
-    return { valid, missingFiles, syntaxIssues, schemaIssues, failingAgent };
+    return { valid, missingFiles, syntaxIssues, typeIssues, schemaIssues, contractIssues, integrationIssues, agentIssues };
   }
 
-  private checkBasicTsSyntax(filePath: string, content: string): string[] {
-    const issues: string[] = [];
+  /**
+   * Builds one retry directive per failing agent, each carrying feedback scoped
+   * to that agent's own issues, so a parallel fan-out re-runs exactly the agents
+   * that failed. Falls back to a single frontend directive carrying the full
+   * issue text if nothing could be attributed (defensive — should not occur once
+   * validation has failed).
+   */
+  private buildRetryPlan(
+    result: ValidationResult,
+    fallbackFeedback: string,
+  ): RetryDirective[] {
+    const plan: RetryDirective[] = [];
+    for (const [agentType, issues] of result.agentIssues) {
+      plan.push({ agentType, feedback: issues.join('\n') });
+    }
+    if (plan.length === 0) {
+      plan.push({ agentType: 'frontend', feedback: fallbackFeedback });
+    }
+    return plan;
+  }
 
-    // Unclosed braces check (rough heuristic)
-    const openBraces = (content.match(/\{/g) ?? []).length;
-    const closeBraces = (content.match(/\}/g) ?? []).length;
-    if (Math.abs(openBraces - closeBraces) > 3) {
-      issues.push(`${filePath}: unbalanced braces (open=${openBraces}, close=${closeBraces})`);
+  /**
+   * Groups every validation issue under the agent responsible for fixing it so
+   * each retried agent receives feedback about only its own failures:
+   *  - content errors (syntax/type/schema/base) use the agentType stamped on the
+   *    error during batch validation (falling back to the file path);
+   *  - missing files are attributed by file extension;
+   *  - contract issues are attributed from their "<agent>: ..." prefix.
+   */
+  private groupIssuesByAgent(
+    validationErrors: ValidationError[],
+    missingFiles: string[],
+    contractIssues: string[],
+  ): Map<AgentType, string[]> {
+    const grouped = new Map<AgentType, string[]>();
+    const add = (agent: AgentType, text: string): void => {
+      const list = grouped.get(agent);
+      if (list) list.push(text);
+      else grouped.set(agent, [text]);
+    };
+
+    for (const error of validationErrors) {
+      const agent = error.agentType ?? this.agentForFile(error.path ?? '');
+      add(agent, `${this.labelFor(error.code)}: ${error.path ? `${error.path}: ` : ''}${error.message}`);
     }
 
-    // Missing imports for common NestJS decorators
+    for (const file of missingFiles) {
+      add(this.agentForFile(file), `MISSING FILE: ${file}`);
+    }
+
+    for (const issue of contractIssues) {
+      add(this.agentFromContractIssue(issue), `CONTRACT: ${issue}`);
+    }
+
+    return grouped;
+  }
+
+  private labelFor(code: ValidationError['code']): string {
+    if (code === 'TS_TYPE') return 'TYPE';
+    if (code === 'TS_SYNTAX' || code === 'SQL_SYNTAX' || code === 'MD_SYNTAX') return 'SYNTAX';
+    if (code === 'CONTRACT') return 'INTEGRATION';
+    return 'SCHEMA';
+  }
+
+  /** Best-effort agent attribution from a file path's extension/suffix. */
+  private agentForFile(filePath: string): AgentType {
+    if (/\.(tsx|jsx|css)$/.test(filePath)) return 'frontend';
+    if (/\.(module|controller|service|guard|pipe|interceptor|dto)\.ts$/.test(filePath)) return 'backend';
+    if (/\.(prisma|sql)$/.test(filePath)) return 'database';
+    if (/\.md$/.test(filePath)) return 'architecture';
+    return 'backend';
+  }
+
+  /** Contract issues are emitted prefixed with "<agent>: ..."; parse the agent. */
+  private agentFromContractIssue(issue: string): AgentType {
+    const prefix = issue.split(':', 1)[0]?.trim().toLowerCase();
     if (
-      content.includes('@Injectable()') &&
-      !content.includes("from '@nestjs/common'")
+      prefix === 'frontend' ||
+      prefix === 'backend' ||
+      prefix === 'database' ||
+      prefix === 'architecture'
     ) {
-      issues.push(`${filePath}: @Injectable used without @nestjs/common import`);
+      return prefix;
     }
-
-    // Unclosed template literals
-    const backtickCount = (content.match(/`/g) ?? []).length;
-    if (backtickCount % 2 !== 0) {
-      issues.push(`${filePath}: odd number of backticks — possible unclosed template literal`);
-    }
-
-    return issues;
+    return 'frontend';
   }
 
-  private checkPrismaSchema(content: string): string[] {
+  private checkAcceptanceCriteria(state: DevFlowStateType): string[] {
     const issues: string[] = [];
+    const contract = state.contract!;
 
-    // Check for duplicate model names
-    const modelMatches = content.match(/^model\s+(\w+)/gm) ?? [];
-    const modelNames = modelMatches.map((m) => m.replace(/^model\s+/, ''));
-    const duplicates = modelNames.filter(
-      (name, idx) => modelNames.indexOf(name) !== idx,
-    );
-    if (duplicates.length > 0) {
-      issues.push(`Duplicate Prisma model names: ${duplicates.join(', ')}`);
-    }
+    for (const criterion of contract.acceptanceCriteria) {
+      const lower = criterion.toLowerCase();
 
-    // Check for missing @id fields
-    const modelBlocks = content.split(/^model\s+/m).slice(1);
-    for (const block of modelBlocks) {
-      if (!/@id/.test(block.split('}')[0] ?? '')) {
-        const name = block.split(/\s/)[0];
-        issues.push(`Prisma model "${name}" may be missing @id field`);
+      if (lower.includes('frontend') || lower.includes('ui') || lower.includes('component')) {
+        const hasFrontend = state.artifacts.some(
+          (a) => a.agentType === 'frontend' && a.content.trim().length > 50,
+        );
+        if (!hasFrontend) {
+          issues.push(`frontend: acceptance criterion "${criterion}" — no meaningful frontend artifacts`);
+        }
+      }
+
+      if (lower.includes('api') || lower.includes('endpoint') || lower.includes('backend')) {
+        const hasBackend = state.artifacts.some(
+          (a) => a.agentType === 'backend' && a.content.trim().length > 50,
+        );
+        if (!hasBackend) {
+          issues.push(`backend: acceptance criterion "${criterion}" — no meaningful backend artifacts`);
+        }
+      }
+
+      if (lower.includes('database') || lower.includes('schema') || lower.includes('model')) {
+        const hasDatabase = state.artifacts.some(
+          (a) => a.agentType === 'database' && a.content.trim().length > 50,
+        );
+        if (!hasDatabase) {
+          issues.push(`database: acceptance criterion "${criterion}" — no meaningful database artifacts`);
+        }
+      }
+
+      if (lower.includes('documentation') || lower.includes('readme') || lower.includes('architecture')) {
+        const hasDocs = state.artifacts.some(
+          (a) => a.filePath.endsWith('.md') && a.content.trim().length > 50,
+        );
+        if (!hasDocs) {
+          issues.push(`architecture: acceptance criterion "${criterion}" — no meaningful documentation artifacts`);
+        }
       }
     }
 

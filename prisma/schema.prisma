@@ -196,6 +196,7 @@ model Artifact {
   revisionHandledAt DateTime?
   revisionHandledById String?         @db.Uuid
   revisionResolutionNote String?      @db.Text
+  source        String?              @default("llm")
   createdAt     DateTime             @default(now())
   tasks         ProjectTask[]
   workOrders    WorkOrder[]

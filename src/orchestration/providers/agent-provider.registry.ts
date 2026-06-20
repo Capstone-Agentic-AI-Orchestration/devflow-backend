@@ -30,6 +30,17 @@ export class AgentProviderRegistry {
         reason: null,
       },
       {
+        // Phase 3: simulation runs the real-shaped graph with deterministic,
+        // event-rich nodes. Always available — no keys or external access.
+        mode: 'simulation' as AgentProviderMode,
+        displayName: 'Simulation Provider',
+        active: requestedMode === 'simulation',
+        available: true,
+        implemented: true,
+        missingRequirements: [],
+        reason: null,
+      },
+      {
         mode: this.llmAgentProvider.mode,
         displayName: `${this.providerDisplayName(this.llmAgentProvider.providerName())} LLM Provider`,
         active: requestedMode === this.llmAgentProvider.mode,
@@ -72,7 +83,9 @@ export class AgentProviderRegistry {
   }
 
   requestedMode(): AgentProviderMode {
-    return process.env.AGENT_PROVIDER === 'llm' ? 'llm' : 'mock';
+    if (process.env.AGENT_PROVIDER === 'llm') return 'llm';
+    if (process.env.AGENT_PROVIDER === 'simulation') return 'simulation';
+    return 'mock';
   }
 
   activeMode(): AgentProviderMode {

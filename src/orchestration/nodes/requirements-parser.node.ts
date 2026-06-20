@@ -8,21 +8,8 @@ import {
 import { GraphLlmProvider } from '../providers/graph-llm.provider';
 import { StreamEmitter } from '../streaming/stream-emitter.service';
 import { humanReadableError } from './human-readable-error';
-
-const SYSTEM_PROMPT = `You are a software architect analyzing a project brief.
-Return a valid JSON object with this exact shape:
-{
-  "projectType": string,
-  "features": string[],
-  "techStack": {
-    "frontend": string,
-    "backend": string,
-    "database": string,
-    "styling": string
-  },
-  "complexity": "simple" | "medium" | "complex",
-  "estimatedFiles": number
-}`;
+import { REQUIREMENTS_PARSER_SYSTEM } from '../prompts/agent-prompts';
+import { resolveModelForNode } from '../providers/base-llm.provider';
 
 // ─── Node ─────────────────────────────────────────────────────────────────────
 
@@ -83,8 +70,9 @@ Analyze this brief and produce a structured requirements document. Base the tech
       this.streamEmitter.emit(projectId, 'requirements_parser', runId ?? '', 'decision', `Calling LLM (${this.graphLlm.model()}) to parse requirements...`);
 
       const result = await this.graphLlm.generateJson<Partial<RequirementsDocument>>({
-        agentName: 'requirements_parser',
-        systemPrompt: SYSTEM_PROMPT,
+        agentName: resolveModelForNode('parse_requirements', 'requirements_parser'),
+        onToken: (delta) => this.streamEmitter.emit(projectId, 'requirements_parser', runId ?? '', 'token', delta),
+        systemPrompt: REQUIREMENTS_PARSER_SYSTEM,
         userPrompt: prompt,
         expectedShape: 'object',
       });

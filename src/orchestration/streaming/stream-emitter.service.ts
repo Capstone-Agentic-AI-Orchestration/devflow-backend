@@ -1,5 +1,7 @@
 import { Injectable, Logger, Optional } from '@nestjs/common';
 import { DevFlowGateway } from '../../gateway/devflow.gateway';
+import { OrchestrationEmitter } from './orchestration-emitter.service';
+import { ORCHESTRATION_PROTOCOL_VERSION } from './protocol';
 
 export interface StreamChunk {
   nodeId: string;
@@ -24,6 +26,7 @@ export class StreamEmitter {
 
   constructor(
     @Optional() private readonly gateway: DevFlowGateway | null,
+    @Optional() private readonly emitter: OrchestrationEmitter | null,
   ) {}
 
   emit(projectId: string, nodeId: string, runId: string, type: StreamChunk['type'], chunk: string, metadata?: Record<string, unknown>): void {
@@ -50,9 +53,23 @@ export class StreamEmitter {
     batch.timer = null;
     this.batches.delete(key);
 
-    if (!this.gateway) return;
-
     const { projectId, nodeId, chunks } = batch;
+
+    // New typed protocol channel (Phase 1).
+    if (this.emitter && chunks.length > 0) {
+      this.emitter.emit(projectId, {
+        v: ORCHESTRATION_PROTOCOL_VERSION,
+        type: 'agent.stream',
+        projectId,
+        runId: chunks[0].runId,
+        nodeId,
+        chunks,
+        ts: Date.now(),
+      });
+    }
+
+    // Legacy channel — kept until the frontend cutover (Phase 4).
+    if (!this.gateway) return;
 
     try {
       this.gateway.emitAgentStream(projectId, nodeId, chunks);

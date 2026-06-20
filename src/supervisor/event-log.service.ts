@@ -1,5 +1,6 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Optional } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
+import { OrchestrationEmitter } from '../orchestration/streaming/orchestration-emitter.service';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -31,7 +32,12 @@ const BUDGET_WARN_THRESHOLD = 0.9;
 export class EventLogService {
   private readonly logger = new Logger(EventLogService.name);
 
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    // Optional to avoid a hard cycle with OrchestrationModule and to keep the
+    // event log working in runtimes without the streaming layer.
+    @Optional() private readonly emitter: OrchestrationEmitter | null,
+  ) {}
 
   // ── Public API ─────────────────────────────────────────────────────────────
 
@@ -119,6 +125,23 @@ export class EventLogService {
       this.logger.warn(
         `[${projectId}] Failed to write COMPLETED EventLog for ${nodeName}: ${String(logResult.reason)}`,
       );
+    }
+
+    // Step 2b: Emit token/cost telemetry on the typed protocol channel.
+    // runId is resolved lazily from the project (set at run start); telemetry is
+    // best-effort and never blocks the node.
+    if (this.emitter) {
+      void this.prisma.project
+        .findUnique({ where: { id: projectId }, select: { runId: true } })
+        .then((project) => {
+          this.emitter?.nodeTelemetry(projectId, nodeName, {
+            runId: project?.runId ?? undefined,
+            inputTokens: costMeta.inputTokens,
+            outputTokens: costMeta.outputTokens,
+            model: costMeta.model,
+          });
+        })
+        .catch(() => undefined);
     }
 
     // Step 3: Budget enforcement warnings.

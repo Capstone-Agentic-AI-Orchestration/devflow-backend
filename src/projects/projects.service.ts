@@ -1,12 +1,17 @@
 import {
   BadRequestException,
   ConflictException,
+  ForbiddenException,
   Injectable,
   Logger,
   NotFoundException,
 } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
-import { OrchestrationService, OrchestrationStatus } from '../orchestration/orchestration.service';
+import {
+  OrchestrationControlResult,
+  OrchestrationService,
+  OrchestrationStatus,
+} from '../orchestration/orchestration.service';
 import { CreateProjectDto } from './dto/create-project.dto';
 import { ArtifactOutputReviewStatus, ArtifactReviewStatus, ArtifactValidationStatus, ClientInviteStatus, CollaborationDocumentStatus, NotificationType, OrchestrationRunTrigger, ProjectDeliveryReview, ProjectDeliveryReviewStatus, ProjectStatus, ProjectTimelineEvent, ProjectTimelineEventType, ProjectTimelineVisibility, ProjectTaskActivity, ProjectTaskActivityType, ProjectTaskStatus, Project, GateEvent, Artifact, EventLog, Prisma, ProjectKickoff, ProjectKickoffStatus, ProjectTask, UserRole, WorkOrder, WorkOrderAgentType, WorkOrderPriority, WorkOrderStatus } from '@prisma/client';
 import { AuthUser } from '../auth/auth.types';
@@ -21,6 +26,7 @@ import { CreateProjectTaskDto, UpdateProjectTaskDto } from './dto/project-task.d
 import { AddTaskCommentDto } from './dto/task-comment.dto';
 import { CreateWorkOrderDto, UpdateWorkOrderDto } from './dto/work-order.dto';
 import { UpdateProjectKickoffDto } from './dto/project-kickoff.dto';
+import { ControlOrchestrationDto } from './dto/control-orchestration.dto';
 import { NotificationsService } from '../notifications/notifications.service';
 import {
   CursorPage,
@@ -423,6 +429,19 @@ export class ProjectsService {
     return { accepted: true, runId };
   }
 
+  async controlOrchestration(
+    id: string,
+    user: AuthUser,
+    dto: ControlOrchestrationDto,
+  ): Promise<OrchestrationControlResult> {
+    await this.assertAccessible(id, user);
+    return this.orchestration.control(id, dto.action, {
+      nodeId: dto.nodeId,
+      params: dto.params,
+      actorId: user.id,
+    });
+  }
+
   async findOrchestrationRuns(id: string, user: AuthUser) {
     await this.assertAccessible(id, user);
 
@@ -528,6 +547,23 @@ export class ProjectsService {
   async verifyOrchestrationLlmProvider(id: string, user: AuthUser) {
     await this.assertAccessible(id, user);
     return this.orchestration.verifyLlmProviderAccess();
+  }
+
+  async autoAnalyzeBrief(
+    user: AuthUser,
+    input: { companyName: string; brief: string; stackKey: string },
+  ) {
+    if (user.role !== UserRole.PM && user.role !== UserRole.ADMIN) {
+      throw new ForbiddenException('Only PMs and admins can use auto-analyze.');
+    }
+    if (!input.brief || input.brief.trim().length < 3) {
+      throw new BadRequestException('Brief must be at least 3 characters to analyze.');
+    }
+    return this.orchestration.autoAnalyzeBrief({
+      companyName: input.companyName || 'Unknown company',
+      brief: input.brief.trim(),
+      stackKey: input.stackKey || 'nextjs-nestjs-supabase',
+    });
   }
 
   async findAll(

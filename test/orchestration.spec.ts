@@ -375,8 +375,9 @@ describe('OrchestrationService', () => {
   it('resumeGate1 with approved=true records APPROVED and resumes graph', async () => {
     prisma.project.findUnique.mockResolvedValue({ runId: 'run-001' });
     const updateState = vi.fn().mockResolvedValue({});
-    const invoke = vi.fn().mockResolvedValue({});
-    (service as unknown as { graph: unknown }).graph = { updateState, invoke };
+    // Phase 1: resume now drives the graph via stream() rather than invoke().
+    const stream = vi.fn().mockResolvedValue((async function* () {})());
+    (service as unknown as { graph: unknown }).graph = { updateState, stream };
     (service as unknown as { checkpointer: { get: ReturnType<typeof vi.fn> } }).checkpointer = {
       get: vi.fn().mockResolvedValue(null),
     };
@@ -390,14 +391,14 @@ describe('OrchestrationService', () => {
       expect.anything(),
       expect.objectContaining({ gate1Approved: true }),
     );
-    expect(invoke).toHaveBeenCalledWith(null, expect.anything());
+    expect(stream).toHaveBeenCalledWith(null, expect.anything());
   });
 
   it('resumeGate2 with approved=true records APPROVED and resumes graph', async () => {
     prisma.project.findUnique.mockResolvedValue({ runId: 'run-002' });
     const updateState = vi.fn().mockResolvedValue({});
-    const invoke = vi.fn().mockResolvedValue({});
-    (service as unknown as { graph: unknown }).graph = { updateState, invoke };
+    const stream = vi.fn().mockResolvedValue((async function* () {})());
+    (service as unknown as { graph: unknown }).graph = { updateState, stream };
     (service as unknown as { checkpointer: { get: ReturnType<typeof vi.fn> } }).checkpointer = {
       get: vi.fn().mockResolvedValue(null),
     };
@@ -408,7 +409,7 @@ describe('OrchestrationService', () => {
       expect.anything(),
       expect.objectContaining({ gate2Approved: true, gate2Notes: 'looks good' }),
     );
-    expect(invoke).toHaveBeenCalledWith(null, expect.anything());
+    expect(stream).toHaveBeenCalledWith(null, expect.anything());
   });
 
   it('resumeGate2 blocks LLM GitHub delivery when GitHub is not configured', async () => {
@@ -1073,14 +1074,14 @@ describe('OrchestrationService', () => {
 
     await expect(
       service.executeWorkOrder('test-project-id', 'work-order-1', 'pm-1'),
-    ).rejects.toThrow('OpenRouter deepseek/deepseek-v4-flash:free returned invalid JSON');
+    ).rejects.toThrow(/OpenRouter deepseek\/deepseek-v4-flash:free.*returned invalid JSON|OpenRouter deepseek\/deepseek-v4-flash:free.*repair returned invalid JSON/);
 
     expect(prisma.artifact.create).not.toHaveBeenCalled();
     expect(prisma.workOrder.update).toHaveBeenCalledWith({
       where: { id: 'work-order-1' },
       data: expect.objectContaining({
         status: WorkOrderStatus.FAILED,
-        executionError: expect.stringContaining('OpenRouter deepseek/deepseek-v4-flash:free returned invalid JSON'),
+        executionError: expect.stringMatching(/OpenRouter deepseek\/deepseek-v4-flash:free.*returned invalid JSON|OpenRouter deepseek\/deepseek-v4-flash:free.*repair returned invalid JSON/),
       }),
     });
   });

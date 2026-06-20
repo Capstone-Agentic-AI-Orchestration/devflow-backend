@@ -1,6 +1,6 @@
 import { Prisma, WorkOrderAgentType, WorkOrderPriority } from '@prisma/client';
 
-export type AgentProviderMode = 'mock' | 'llm';
+export type AgentProviderMode = 'mock' | 'llm' | 'simulation';
 
 export interface WorkOrderAgentContext {
   project: {

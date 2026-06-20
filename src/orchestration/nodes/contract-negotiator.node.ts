@@ -6,22 +6,8 @@ import { EventLogService } from '../../supervisor/event-log.service';
 import { GraphLlmProvider } from '../providers/graph-llm.provider';
 import { StreamEmitter } from '../streaming/stream-emitter.service';
 import { humanReadableError } from './human-readable-error';
-
-// ─── Constants ────────────────────────────────────────────────────────────────
-
-const SYSTEM_PROMPT = `You are a senior software architect producing a detailed project contract.
-You respond ONLY with a valid JSON object — no markdown fences, no prose outside the JSON.
-
-The JSON must match this exact shape:
-{
-  "projectId": string,
-  "projectName": string,
-  "description": string,
-  "requirements": <the exact requirements object passed in>,
-  "fileManifest": string[],
-  "acceptanceCriteria": string[],
-  "lockedAt": string
-}`;
+import { CONTRACT_NEGOTIATOR_SYSTEM, buildAgentSystemPrompt } from '../prompts/agent-prompts';
+import { resolveModelForNode } from '../providers/base-llm.provider';
 
 // ─── Node ─────────────────────────────────────────────────────────────────────
 
@@ -105,11 +91,15 @@ export class ContractNegotiatorNode {
       this.streamEmitter.emit(projectId, 'contract_negotiator', runId ?? '', 'decision', `Calling LLM (${this.graphLlm.model()}) to negotiate contract with ${memoryBundle.total} memory references...`);
 
       // ── 2. LLM call ───────────────────────────────────────────────────────
+      const systemPrompt = buildAgentSystemPrompt(
+        CONTRACT_NEGOTIATOR_SYSTEM,
+        memoryContext,
+      );
+
       const result = await this.graphLlm.generateJson<Record<string, unknown>>({
-        agentName: 'contract_negotiator',
-        systemPrompt: memoryContext
-          ? `${SYSTEM_PROMPT}\n\nRelevant memory:\n${memoryContext}`
-          : SYSTEM_PROMPT,
+        agentName: resolveModelForNode('negotiate_contract', 'contract_negotiator'),
+        onToken: (delta) => this.streamEmitter.emit(projectId, 'contract_negotiator', runId ?? '', 'token', delta),
+        systemPrompt,
         userPrompt: `Create a complete project contract for the following:
 
 Company: ${state.companyName}

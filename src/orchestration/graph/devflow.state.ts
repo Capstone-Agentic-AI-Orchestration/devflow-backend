@@ -27,11 +27,23 @@ export interface ProjectContract {
   lockedAt: string;
 }
 
+export type ArtifactSource = 'llm' | 'scaffold' | 'skip' | 'mock';
+
+/**
+ * A single agent's retry instruction emitted by the validator: which code agent
+ * to re-run and the validation feedback scoped to that agent's own failures.
+ */
+export interface RetryDirective {
+  agentType: 'frontend' | 'backend' | 'database' | 'architecture';
+  feedback: string;
+}
+
 export interface GeneratedArtifact {
   agentType: 'frontend' | 'backend' | 'database' | 'architecture';
   filePath: string;
   content: string;
   language: string;
+  source?: ArtifactSource;
 }
 
 export function mergeArtifactsByPath(
@@ -120,6 +132,22 @@ export const DevFlowState = Annotation.Root({
 
   error: Annotation<string | null>({
     default: () => null,
+    reducer: (_, next) => next,
+  }),
+
+  validationFeedback: Annotation<string | null>({
+    default: () => null,
+    reducer: (_, next) => next,
+  }),
+
+  /**
+   * Agents the validator wants to re-run, each with feedback scoped to its own
+   * failures. A non-empty plan drives a parallel retry fan-out from
+   * validate_outputs; an empty plan means validation either passed or exhausted
+   * its retry budget.
+   */
+  retryPlan: Annotation<RetryDirective[]>({
+    default: () => [],
     reducer: (_, next) => next,
   }),
 });

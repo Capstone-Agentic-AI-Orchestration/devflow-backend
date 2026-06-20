@@ -9,6 +9,10 @@ import {
   OnGatewayDisconnect,
 } from '@nestjs/websockets';
 import { Server, Socket } from 'socket.io';
+import {
+  ORCHESTRATION_EVENT_CHANNEL,
+  type OrchestrationEvent,
+} from '../orchestration/streaming/protocol';
 
 interface SubscribePayload {
   projectId: string;
@@ -146,6 +150,17 @@ export class DevFlowGateway implements OnGatewayConnection, OnGatewayDisconnect 
       timestamp: Date.now(),
     };
     this.server.to(projectId).emit('orchestration:state', payload);
+  }
+
+  /**
+   * Phase 1 — typed protocol channel. Broadcasts a single discriminated
+   * OrchestrationEvent to all clients in the projectId room on the
+   * `orchestration:event` channel. The legacy `project:status` /
+   * `orchestration:state` / `agent:stream` events continue to fire alongside
+   * this until the frontend cutover (Phase 4).
+   */
+  emitEvent(projectId: string, event: OrchestrationEvent): void {
+    this.server.to(projectId).emit(ORCHESTRATION_EVENT_CHANNEL, event);
   }
 
   /**

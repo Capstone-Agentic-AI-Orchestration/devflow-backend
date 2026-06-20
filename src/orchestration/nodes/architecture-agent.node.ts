@@ -1,4 +1,5 @@
 import { Injectable, Logger } from '@nestjs/common';
+import { WorkOrderAgentType } from '@prisma/client';
 import { DevFlowStateType, GeneratedArtifact } from '../graph/devflow.state';
 import { MemoryService } from '../../memory/memory.service';
 import { EventLogService } from '../../supervisor/event-log.service';
@@ -6,15 +7,9 @@ import { GraphLlmProvider } from '../providers/graph-llm.provider';
 import { PrismaService } from '../../prisma/prisma.service';
 import { StreamEmitter } from '../streaming/stream-emitter.service';
 import { humanReadableError } from './human-readable-error';
-
-// ─── Constants ────────────────────────────────────────────────────────────────
-
-const SYSTEM_PROMPT = `You are a senior software architect generating comprehensive documentation.
-Respond ONLY with a JSON array — no prose, no markdown fences.
-
-Each element: { "filePath": string, "content": string, "language": string }`;
-
-// ─── Node ─────────────────────────────────────────────────────────────────────
+import { ARCHITECTURE_AGENT_SYSTEM, buildAgentSystemPrompt } from '../prompts/agent-prompts';
+import { resolveModelForNode } from '../providers/base-llm.provider';
+import { ProjectScaffolderService } from '../scaffolding/project-scaffolder.service';
 
 @Injectable()
 export class ArchitectureAgentNode {
@@ -26,6 +21,7 @@ export class ArchitectureAgentNode {
     private readonly eventLog: EventLogService,
     private readonly graphLlm: GraphLlmProvider,
     private readonly streamEmitter: StreamEmitter,
+    private readonly scaffolder: ProjectScaffolderService,
   ) {}
 
   async execute(
@@ -39,15 +35,11 @@ export class ArchitectureAgentNode {
       return { error: 'ArchitectureAgentNode: contract is null' };
     }
 
-    // Log STARTED — allSettled inside, so failure here does not block the node.
     await this.eventLog.logStarted(projectId, 'architecture_agent');
 
     this.streamEmitter.emit(projectId, 'architecture_agent', runId ?? '', 'decision', 'Starting architecture documentation generation...');
 
     try {
-      // ── 1. Read relevant memories ──────────────────────────────────────────
-      // companyName is included so industry-specific architecture patterns
-      // (e.g. "fintech microservices complex") rank above generic results.
       const memoryQuery = [
         state.contract.requirements.projectType,
         state.stackKey,
@@ -68,9 +60,6 @@ export class ArchitectureAgentNode {
 
       const docFiles = ['ARCHITECTURE.md', 'API.md', 'DEPLOYMENT.md'];
 
-      // ── 2. Skip-generation check ───────────────────────────────────────────
-      // Must run AFTER readRelevant so memory context is still available if the
-      // skip threshold is not met. Returns immediately — no LLM tokens consumed.
       const skipCandidate = await this.memory.findSkipCandidate(
         'architecture',
         memoryQuery,
@@ -79,57 +68,77 @@ export class ArchitectureAgentNode {
       );
 
       if (skipCandidate) {
-        this.logger.log(
-          `[${state.projectId}] Skip-generation: reusing architecture memory artifact (similarity=${skipCandidate.similarity?.toFixed(3)})`,
+        const isValid = this.memory.validateSkipCandidate(
+          skipCandidate,
+          state.contract.acceptanceCriteria,
         );
-        const rememberedFilePath = skipCandidate.metadata['filePath'];
-        const artifact: GeneratedArtifact = {
-          agentType: 'architecture',
-          filePath:
-            typeof rememberedFilePath === 'string'
-              ? rememberedFilePath
-              : 'ARCHITECTURE.md',
-          content: skipCandidate.content,
-          language: 'markdown',
-        };
-        return { artifacts: this.completeArtifacts(docFiles, [artifact], state) };
+        if (isValid) {
+          this.logger.log(
+            `[${state.projectId}] Skip-generation: reusing architecture memory artifact (similarity=${skipCandidate.similarity?.toFixed(3)})`,
+          );
+          await this.memory.bumpUsageStats(skipCandidate.id);
+          const rememberedFilePath = skipCandidate.metadata['filePath'];
+          const artifact: GeneratedArtifact = {
+            agentType: 'architecture',
+            filePath:
+              typeof rememberedFilePath === 'string'
+                ? rememberedFilePath
+                : 'ARCHITECTURE.md',
+            content: skipCandidate.content,
+            language: 'markdown',
+            source: 'skip',
+          };
+          return { artifacts: [artifact] };
+        }
+        this.logger.log(
+          `[${state.projectId}] Skip candidate failed acceptance validation, proceeding with LLM generation`,
+        );
       }
 
-      // ── 3. Summarise generated artifacts ──────────────────────────────────
       const artifactSummary = state.artifacts
         .map((a) => `${a.agentType}: ${a.filePath}`)
         .join('\n');
 
       if (process.env.MOCK_MODE === 'true') {
         this.streamEmitter.emit(projectId, 'architecture_agent', runId ?? '', 'decision', 'Mock mode: generating predefined architecture docs');
-        const artifacts = this.completeArtifacts(
-          docFiles,
-          [
-            {
-              agentType: 'architecture',
-              filePath: 'ARCHITECTURE.md',
-              content: `# Mock Architecture\n\nGenerated by Mock Mode.`,
-              language: 'markdown'
-            }
-          ],
-          state,
-        );
+        const artifacts: GeneratedArtifact[] = [
+          {
+            agentType: 'architecture',
+            filePath: 'ARCHITECTURE.md',
+            content: `# Mock Architecture\n\nGenerated by Mock Mode.`,
+            language: 'markdown',
+            source: 'mock',
+          },
+        ];
         await this.eventLog.logCompleted(state.projectId, 'architecture_agent', { inputTokens: 0, outputTokens: 0, model: 'mock' });
-        return { artifacts };
+        return { artifacts, validationFeedback: null };
       }
 
       this.streamEmitter.emit(projectId, 'architecture_agent', runId ?? '', 'decision', `Calling LLM (${this.graphLlm.model()}) to generate architecture docs...`);
 
-      // ── 4. LLM call ───────────────────────────────────────────────────────
+      const feedbackContext = state.validationFeedback
+        ? `Your previous attempt had these validation issues. Fix them in your new output:\n${state.validationFeedback}`
+        : '';
+
+      const artifactManifest = (state.artifacts ?? [])
+        .map((a) => `${a.agentType}: ${a.filePath}`)
+        .join('\n');
+
+      const systemPrompt = buildAgentSystemPrompt(
+        ARCHITECTURE_AGENT_SYSTEM,
+        memoryContext,
+        artifactManifest,
+        feedbackContext,
+      );
+
       const result = await this.graphLlm.generateJson<Array<{
         filePath: string;
         content: string;
         language?: string;
       }>>({
-        agentName: 'architecture_agent',
-        systemPrompt: memoryContext
-          ? `${SYSTEM_PROMPT}\n\nRelevant memory:\n${memoryContext}`
-          : SYSTEM_PROMPT,
+        agentName: resolveModelForNode('architecture_agent', 'architecture_agent'),
+        onToken: (delta) => this.streamEmitter.emit(projectId, 'architecture_agent', runId ?? '', 'token', delta),
+        systemPrompt,
         userPrompt: `Generate architecture documentation for this project:
 
 Project: ${state.contract.projectName}
@@ -164,22 +173,18 @@ Generate these 3 documentation files:
         expectedShape: 'array',
       });
 
-      const artifacts = this.completeArtifacts(
-        docFiles,
-        result.value.map((item) => ({
-          agentType: 'architecture' as const,
-          filePath: item.filePath,
-          content: item.content,
-          language: item.language ?? 'markdown',
-        })),
-        state,
-      );
+      const artifacts: GeneratedArtifact[] = result.value.map((item) => ({
+        agentType: 'architecture' as const,
+        filePath: item.filePath,
+        content: item.content,
+        language: item.language ?? 'markdown',
+        source: 'llm',
+      }));
 
       this.logger.log(
         `[${state.projectId}] Architecture agent generated ${artifacts.length} docs (${memoryBundle.total} layered memories injected)`,
       );
 
-      // Log COMPLETED — model field drives cost attribution in RunSupervisorService.
       await this.eventLog.logCompleted(state.projectId, 'architecture_agent', {
         inputTokens: result.usage.inputTokens,
         outputTokens: result.usage.outputTokens,
@@ -188,119 +193,19 @@ Generate these 3 documentation files:
 
       await this.prisma.artifact.createMany({
         data: artifacts.map((a: GeneratedArtifact) => ({
-          projectId: state.projectId, agentType: a.agentType, filePath: a.filePath, content: a.content, language: a.language,
+          projectId: state.projectId, agentType: a.agentType, filePath: a.filePath, content: a.content, language: a.language, source: a.source ?? 'llm',
         })),
         skipDuplicates: true,
       }).catch(() => {});
 
       this.streamEmitter.emit(projectId, 'architecture_agent', runId ?? '', 'decision', `Architecture documentation complete: ${artifacts.length} files generated (${result.usage.outputTokens} output tokens)`);
 
-      return { artifacts };
+      return { artifacts, validationFeedback: null };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       this.logger.error(`[${state.projectId}] Architecture agent failed: ${message}`);
       this.streamEmitter.emit(projectId, 'architecture_agent', runId ?? '', 'error', `Architecture generation failed: ${humanReadableError(message)}`);
       return { error: `ArchitectureAgentNode failed: ${message}` };
     }
-  }
-
-  private completeArtifacts(
-    requestedFiles: string[],
-    generated: GeneratedArtifact[],
-    state: DevFlowStateType,
-  ): GeneratedArtifact[] {
-    const byPath = new Map(generated.map((artifact) => [artifact.filePath, artifact]));
-
-    return requestedFiles.map((filePath) => {
-      const artifact = byPath.get(filePath);
-      if (artifact?.content?.trim()) return artifact;
-
-      return {
-        agentType: 'architecture' as const,
-        filePath,
-        content: this.fallbackContent(filePath, state),
-        language: 'markdown',
-      };
-    });
-  }
-
-  private fallbackContent(filePath: string, state: DevFlowStateType): string {
-    const projectName = state.contract?.projectName ?? state.companyName;
-    const description = state.contract?.description ?? state.brief;
-
-    if (filePath === 'API.md') {
-      return `# API
-
-## Overview
-
-${projectName} exposes REST endpoints for health checks and task management.
-
-## Endpoints
-
-### GET /health
-
-Returns service health.
-
-### GET /tasks
-
-Returns task records.
-
-### POST /tasks
-
-Creates a task from a JSON body with a title and optional description.
-
-## Errors
-
-Errors use standard HTTP status codes with a JSON message body.
-`;
-    }
-
-    if (filePath === 'DEPLOYMENT.md') {
-      return `# Deployment
-
-## Prerequisites
-
-- Node.js runtime
-- PostgreSQL database
-- Environment variables for database and application configuration
-
-## Steps
-
-1. Install dependencies.
-2. Run database migrations.
-3. Build the frontend and backend.
-4. Start the production server.
-
-## Health Check
-
-Use \`GET /health\` after deployment.
-`;
-    }
-
-    return `# Architecture
-
-## System Overview
-
-${projectName} is generated from this brief: ${description}
-
-## Components
-
-- Next.js frontend for the user interface.
-- NestJS backend for application APIs.
-- Prisma and PostgreSQL for persistence.
-
-## Flow
-
-\`\`\`mermaid
-graph TD
-  User[User] --> Web[Next.js Frontend]
-  Web --> Api[NestJS API]
-  Api --> Db[(PostgreSQL)]
-\`\`\`
-
-## Decisions
-
-The generated architecture keeps frontend, backend, and database responsibilities separate so each area can be developed independently.
-`;
   }
 }

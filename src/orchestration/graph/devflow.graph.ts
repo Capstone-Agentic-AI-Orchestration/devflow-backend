@@ -4,7 +4,6 @@ import {
   END,
   START,
   NodeInterrupt,
-  Send,
   CompiledStateGraph,
 } from '@langchain/langgraph';
 import { PostgresSaver } from '@langchain/langgraph-checkpoint-postgres';
@@ -18,25 +17,203 @@ import { ArchitectureAgentNode } from '../nodes/architecture-agent.node';
 import { ValidatorNode } from '../nodes/validator.node';
 import { GithubCommitNode } from '../nodes/github-commit.node';
 import { PrismaService } from '../../prisma/prisma.service';
+import { OrchestrationEmitter } from '../streaming/orchestration-emitter.service';
+import { NODE, gate1Router, validatorRouter, gate2Router } from './topology';
 
-// ─── Node Names ───────────────────────────────────────────────────────────────
+export { NODE } from './topology';
 
-export const NODE = {
-  PARSE_REQUIREMENTS: 'parse_requirements',
-  NEGOTIATE_CONTRACT: 'negotiate_contract',
-  GATE_1_CHECK: 'gate_1_check',
-  FRONTEND_AGENT: 'frontend_agent',
-  BACKEND_AGENT: 'backend_agent',
-  DATABASE_AGENT: 'database_agent',
-  ARCHITECTURE_AGENT: 'architecture_agent',
-  VALIDATE_OUTPUTS: 'validate_outputs',
-  GATE_2_CHECK: 'gate_2_check',
-  COMMIT_TO_GITHUB: 'commit_to_github',
-  MARK_DELIVERED: 'mark_delivered',
-} as const;
+type CompiledDevFlowGraph = CompiledStateGraph<
+  DevFlowStateType,
+  Partial<DevFlowStateType>,
+  string
+>;
 
-// ─── Graph Builder ─────────────────────────────────────────────────────────────
+/** A swappable processing-node implementation (real LLM agents or simulation). */
+export type NodeImpl = (
+  state: DevFlowStateType,
+) => Partial<DevFlowStateType> | Promise<Partial<DevFlowStateType>>;
 
+/**
+ * The processing nodes whose behavior varies by run mode. Gate checks and
+ * mark_delivered are infrastructure (built identically for every mode) and are
+ * NOT part of this map.
+ */
+export interface DevFlowNodeImpls {
+  [NODE.PARSE_REQUIREMENTS]: NodeImpl;
+  [NODE.NEGOTIATE_CONTRACT]: NodeImpl;
+  [NODE.FRONTEND_AGENT]: NodeImpl;
+  [NODE.BACKEND_AGENT]: NodeImpl;
+  [NODE.DATABASE_AGENT]: NodeImpl;
+  [NODE.ARCHITECTURE_AGENT]: NodeImpl;
+  [NODE.VALIDATE_OUTPUTS]: NodeImpl;
+  [NODE.COMMIT_TO_GITHUB]: NodeImpl;
+}
+
+// ─── Generic builder ────────────────────────────────────────────────────────────
+
+/**
+ * Builds and compiles the DevFlow graph from a declarative topology and a set of
+ * processing-node implementations. The same topology + builder serve the live
+ * (LLM) graph and the simulation graph — only the impls differ.
+ */
+export function buildGraph(
+  impls: DevFlowNodeImpls,
+  prisma: PrismaService,
+  checkpointer: PostgresSaver,
+  emitter?: OrchestrationEmitter | null,
+): CompiledDevFlowGraph {
+  const logger = new Logger('DevFlowGraph');
+
+  const graph = new StateGraph(DevFlowState) as any;
+
+  // ── Per-node instrumentation ──────────────────────────────────────────────
+  //
+  // Wraps every node to emit precise lifecycle (entering/exiting/error) and
+  // wall-time telemetry on the typed protocol channel. NodeInterrupt (gate
+  // pauses) is re-thrown without being reported as an error — it is an expected
+  // control-flow signal.
+  const instrument =
+    (nodeId: string, action: (state: any) => any) =>
+    async (state: any): Promise<any> => {
+      const { projectId, runId } = state ?? {};
+      emitter?.nodeLifecycle(projectId, runId ?? '', nodeId, 'entering');
+      const startedAt = Date.now();
+      try {
+        const result = await action(state);
+        emitter?.nodeTelemetry(projectId, nodeId, {
+          runId: runId ?? undefined,
+          wallMs: Date.now() - startedAt,
+        });
+        const phase = result && result.error ? 'error' : 'exiting';
+        emitter?.nodeLifecycle(projectId, runId ?? '', nodeId, phase);
+        return result;
+      } catch (error) {
+        if (error instanceof NodeInterrupt) {
+          emitter?.nodeLifecycle(projectId, runId ?? '', nodeId, 'exiting');
+          throw error;
+        }
+        emitter?.nodeLifecycle(projectId, runId ?? '', nodeId, 'error');
+        throw error;
+      }
+    };
+
+  const addProcessingNode = (name: keyof DevFlowNodeImpls): void => {
+    graph.addNode(name, instrument(name, (state: any) => impls[name](state)));
+  };
+
+  // ── Processing nodes (swappable) ──────────────────────────────────────────
+
+  addProcessingNode(NODE.PARSE_REQUIREMENTS);
+  addProcessingNode(NODE.NEGOTIATE_CONTRACT);
+  addProcessingNode(NODE.FRONTEND_AGENT);
+  addProcessingNode(NODE.BACKEND_AGENT);
+  addProcessingNode(NODE.DATABASE_AGENT);
+  addProcessingNode(NODE.ARCHITECTURE_AGENT);
+  addProcessingNode(NODE.VALIDATE_OUTPUTS);
+  addProcessingNode(NODE.COMMIT_TO_GITHUB);
+
+  // ── Infrastructure nodes (identical across modes) ─────────────────────────
+
+  graph.addNode(NODE.GATE_1_CHECK, instrument(NODE.GATE_1_CHECK, async (state: any) => {
+    if (state.error) {
+      logger.error(`[${state.projectId}] Error before gate 1: ${state.error}`);
+      return {};
+    }
+    if (!state.gate1Approved) {
+      logger.log(`[${state.projectId}] Interrupting at gate 1`);
+      await prisma.project.update({
+        where: { id: state.projectId },
+        data: { status: 'AWAITING_GATE_1' },
+      });
+      throw new NodeInterrupt({ type: 'GATE_1_REQUIRED', projectId: state.projectId });
+    }
+    logger.log(`[${state.projectId}] Gate 1 approved, continuing`);
+    await prisma.project.update({
+      where: { id: state.projectId },
+      data: { status: 'GENERATING_CODE' },
+    });
+    return {};
+  }));
+
+  graph.addNode(NODE.GATE_2_CHECK, instrument(NODE.GATE_2_CHECK, async (state: any) => {
+    if (!state.gate2Approved) {
+      logger.log(`[${state.projectId}] Interrupting at gate 2`);
+      await prisma.project.update({
+        where: { id: state.projectId },
+        data: { status: 'AWAITING_GATE_2' },
+      });
+      throw new NodeInterrupt({ type: 'GATE_2_REQUIRED', projectId: state.projectId });
+    }
+    logger.log(`[${state.projectId}] Gate 2 approved, committing`);
+    return {};
+  }));
+
+  graph.addNode(NODE.MARK_DELIVERED, instrument(NODE.MARK_DELIVERED, async (state: any) => {
+    logger.log(`[${state.projectId}] Marking project as delivered`);
+    await prisma.project.update({
+      where: { id: state.projectId },
+      data: { status: 'DELIVERED' },
+    });
+    return {};
+  }));
+
+  // Terminal failure: a hard error (pre-codegen failure or validation that
+  // exhausted its retries) records FAILED immediately instead of leaving the
+  // project in GENERATING_CODE until the supervisor's stale-detection escalates
+  // it. Emits a structured run.error so the failure surfaces live, not minutes
+  // later. Mirrors mark_delivered (authoritative status write) on the sad path.
+  graph.addNode(NODE.MARK_FAILED, instrument(NODE.MARK_FAILED, async (state: any) => {
+    const reason: string = state.error ?? 'Run failed';
+    logger.warn(`[${state.projectId}] Marking project as failed: ${reason}`);
+    await prisma.project.update({
+      where: { id: state.projectId },
+      data: { status: 'FAILED' },
+    });
+    emitter?.runError(state.projectId, state.runId ?? '', {
+      code: /validation/i.test(reason) ? 'VALIDATION_FAILED' : 'NODE_FAILED',
+      severity: 'permanent',
+      message: reason,
+    });
+    return {};
+  }));
+
+  // ── Edge wiring (declarative routers from topology.ts) ────────────────────
+
+  graph.addEdge(START, NODE.PARSE_REQUIREMENTS);
+  graph.addEdge(NODE.PARSE_REQUIREMENTS, NODE.NEGOTIATE_CONTRACT);
+  graph.addEdge(NODE.NEGOTIATE_CONTRACT, NODE.GATE_1_CHECK);
+
+  // Gate 1 → parallel fan-out to every code agent (Send), joined at
+  // validate_outputs via the artifacts append reducer.
+  graph.addConditionalEdges(NODE.GATE_1_CHECK, gate1Router);
+
+  graph.addEdge(NODE.FRONTEND_AGENT, NODE.VALIDATE_OUTPUTS);
+  graph.addEdge(NODE.BACKEND_AGENT, NODE.VALIDATE_OUTPUTS);
+  graph.addEdge(NODE.DATABASE_AGENT, NODE.VALIDATE_OUTPUTS);
+  graph.addEdge(NODE.ARCHITECTURE_AGENT, NODE.VALIDATE_OUTPUTS);
+
+  // Validation → parallel retry fan-out to failing agents (retryPlan) or Gate 2.
+  graph.addConditionalEdges(NODE.VALIDATE_OUTPUTS, validatorRouter);
+
+  // Gate 2 → END (terminal error) or commit.
+  graph.addConditionalEdges(NODE.GATE_2_CHECK, gate2Router);
+
+  graph.addEdge(NODE.COMMIT_TO_GITHUB, NODE.MARK_DELIVERED);
+  graph.addEdge(NODE.MARK_DELIVERED, END);
+
+  // Terminal failure node (target of gate1/gate2 error routing) → END.
+  graph.addEdge(NODE.MARK_FAILED, END);
+
+  return graph.compile({ checkpointer }) as CompiledDevFlowGraph;
+}
+
+// ─── Live (LLM) graph ───────────────────────────────────────────────────────────
+
+/**
+ * Builds the live DevFlow graph backed by the real agent node implementations.
+ * Thin wrapper over {@link buildGraph} that maps the injected node instances to
+ * the implementation map.
+ */
 export function buildDevFlowGraph(
   requirementsParser: RequirementsParserNode,
   contractNegotiator: ContractNegotiatorNode,
@@ -48,183 +225,18 @@ export function buildDevFlowGraph(
   githubCommit: GithubCommitNode,
   prisma: PrismaService,
   checkpointer: PostgresSaver,
-): CompiledStateGraph<DevFlowStateType, Partial<DevFlowStateType>, string> {
-  const logger = new Logger('DevFlowGraph');
+  emitter?: OrchestrationEmitter | null,
+): CompiledDevFlowGraph {
+  const impls: DevFlowNodeImpls = {
+    [NODE.PARSE_REQUIREMENTS]: (state) => requirementsParser.execute(state),
+    [NODE.NEGOTIATE_CONTRACT]: (state) => contractNegotiator.execute(state),
+    [NODE.FRONTEND_AGENT]: (state) => frontendAgent.execute(state),
+    [NODE.BACKEND_AGENT]: (state) => backendAgent.execute(state),
+    [NODE.DATABASE_AGENT]: (state) => databaseAgent.execute(state),
+    [NODE.ARCHITECTURE_AGENT]: (state) => architectureAgent.execute(state),
+    [NODE.VALIDATE_OUTPUTS]: (state) => validator.execute(state),
+    [NODE.COMMIT_TO_GITHUB]: (state) => githubCommit.execute(state),
+  };
 
-  const graph = new StateGraph(DevFlowState) as any;
-
-  // ── Node definitions ────────────────────────────────────────────────────────
-
-  graph.addNode(NODE.PARSE_REQUIREMENTS, (state: any) =>
-    requirementsParser.execute(state),
-  );
-
-  graph.addNode(NODE.NEGOTIATE_CONTRACT, (state: any) =>
-    contractNegotiator.execute(state),
-  );
-
-  graph.addNode(NODE.GATE_1_CHECK, async (state: any) => {
-    if (state.error) {
-      logger.error(`[${state.projectId}] Error before gate 1: ${state.error}`);
-      return {};
-    }
-    if (!state.gate1Approved) {
-      logger.log(`[${state.projectId}] Interrupting at gate 1`);
-      await prisma.project.update({
-        where: { id: state.projectId },
-        data: { status: 'AWAITING_GATE_1' },
-      });
-      throw new NodeInterrupt({
-        type: 'GATE_1_REQUIRED',
-        projectId: state.projectId,
-      });
-    }
-    logger.log(`[${state.projectId}] Gate 1 approved, continuing`);
-    await prisma.project.update({
-      where: { id: state.projectId },
-      data: { status: 'GENERATING_CODE' },
-    });
-    return {};
-  });
-
-  graph.addNode(NODE.FRONTEND_AGENT, (state: any) =>
-    frontendAgent.execute(state),
-  );
-
-  graph.addNode(NODE.BACKEND_AGENT, (state: any) =>
-    backendAgent.execute(state),
-  );
-
-  graph.addNode(NODE.DATABASE_AGENT, (state: any) =>
-    databaseAgent.execute(state),
-  );
-
-  graph.addNode(NODE.ARCHITECTURE_AGENT, (state: any) =>
-    architectureAgent.execute(state),
-  );
-
-  graph.addNode(NODE.VALIDATE_OUTPUTS, (state: any) =>
-    validator.execute(state),
-  );
-
-  graph.addNode(NODE.GATE_2_CHECK, async (state: any) => {
-    if (!state.gate2Approved) {
-      logger.log(`[${state.projectId}] Interrupting at gate 2`);
-      await prisma.project.update({
-        where: { id: state.projectId },
-        data: { status: 'AWAITING_GATE_2' },
-      });
-      throw new NodeInterrupt({
-        type: 'GATE_2_REQUIRED',
-        projectId: state.projectId,
-      });
-    }
-    logger.log(`[${state.projectId}] Gate 2 approved, committing`);
-    return {};
-  });
-
-  graph.addNode(NODE.COMMIT_TO_GITHUB, (state: any) =>
-    githubCommit.execute(state),
-  );
-
-  graph.addNode(NODE.MARK_DELIVERED, async (state: any) => {
-    logger.log(`[${state.projectId}] Marking project as delivered`);
-    await prisma.project.update({
-      where: { id: state.projectId },
-      data: { status: 'DELIVERED' },
-    });
-    return {};
-  });
-
-  // ── Edge wiring ────────────────────────────────────────────────────────────
-
-  graph.addEdge(START, NODE.PARSE_REQUIREMENTS);
-  graph.addEdge(NODE.PARSE_REQUIREMENTS, NODE.NEGOTIATE_CONTRACT);
-  graph.addEdge(NODE.NEGOTIATE_CONTRACT, NODE.GATE_1_CHECK);
-
-  // After gate 1: error → END, approved → code generation.
-  //
-  // Phase 2D — complexity-based fan-out:
-  //   'complex'          → dispatch all four code-gen agents in PARALLEL via
-  //                         Send(), allowing LLM calls to overlap. LangGraph
-  //                         treats each Send() as an independent branch; the
-  //                         validate_outputs node acts as the natural join point
-  //                         because it reads state.artifacts (reducer = append),
-  //                         which accumulates outputs from all parallel branches.
-  //   'simple' | 'medium' → sequential execution (frontend → backend → database
-  //                         → architecture) to minimise concurrent API load for
-  //                         smaller projects.
-  //
-  // Note: Send() passes the current state snapshot to each target node. The
-  // artifacts reducer (existing, next) => [...existing, ...next] merges all
-  // parallel outputs before validate_outputs runs.
-  graph.addConditionalEdges(NODE.GATE_1_CHECK, (state: any) => {
-    if (state.error) return END;
-
-    logger.log(
-      `[${state.projectId}] Dispatching all code agents in parallel`,
-    );
-    return [
-      new Send(NODE.FRONTEND_AGENT, state),
-      new Send(NODE.BACKEND_AGENT, state),
-      new Send(NODE.DATABASE_AGENT, state),
-      new Send(NODE.ARCHITECTURE_AGENT, state),
-    ];
-  });
-
-  // ── Code-gen node routing ──────────────────────────────────────────────────
-  //
-  // All agents run in parallel (via Send() above). Each routes directly to
-  // validate_outputs. LangGraph merges all parallel branch updates via the
-  // artifacts reducer (existing, next) => [...existing, ...next] before
-  // continuing.
-
-  graph.addEdge(NODE.FRONTEND_AGENT, NODE.VALIDATE_OUTPUTS);
-  graph.addEdge(NODE.BACKEND_AGENT, NODE.VALIDATE_OUTPUTS);
-  graph.addEdge(NODE.DATABASE_AGENT, NODE.VALIDATE_OUTPUTS);
-  graph.addEdge(NODE.ARCHITECTURE_AGENT, NODE.VALIDATE_OUTPUTS);
-
-  // After validation:
-  //   - error starts with "RETRY:" → route back to the appropriate agent
-  //   - any other error (max retries exceeded) → gate 2 for human review
-  //   - no error → gate 2
-  graph.addConditionalEdges(NODE.VALIDATE_OUTPUTS, (state: any) => {
-    if (state.error?.startsWith('RETRY:')) {
-      const agentHint = state.error.slice('RETRY:'.length);
-      switch (agentHint) {
-        case 'backend':
-          return NODE.BACKEND_AGENT;
-        case 'database':
-          return NODE.DATABASE_AGENT;
-        case 'architecture':
-          return NODE.ARCHITECTURE_AGENT;
-        default:
-          // frontend or unknown — restart the generation pipeline
-          return NODE.FRONTEND_AGENT;
-      }
-    }
-    return NODE.GATE_2_CHECK;
-  });
-
-  // After gate 2: terminal error → END, approved → commit
-  // Note: RETRY: errors at this stage are treated as warnings, not terminal
-  graph.addConditionalEdges(NODE.GATE_2_CHECK, (state: any) => {
-    const isTerminalError =
-      state.error !== null &&
-      state.error !== undefined &&
-      !state.error.startsWith('RETRY:');
-    if (isTerminalError) return END;
-    return NODE.COMMIT_TO_GITHUB;
-  });
-
-  graph.addEdge(NODE.COMMIT_TO_GITHUB, NODE.MARK_DELIVERED);
-  graph.addEdge(NODE.MARK_DELIVERED, END);
-
-  // ── Compile with checkpointer ──────────────────────────────────────────────
-
-  return graph.compile({ checkpointer }) as CompiledStateGraph<
-    DevFlowStateType,
-    Partial<DevFlowStateType>,
-    string
-  >;
+  return buildGraph(impls, prisma, checkpointer, emitter);
 }

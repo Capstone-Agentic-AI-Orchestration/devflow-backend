@@ -20,6 +20,7 @@ import { UserRole } from '@prisma/client';
 import { ProjectsService } from './projects.service';
 import { CreateProjectDto } from './dto/create-project.dto';
 import { ApproveGateDto } from './dto/approve-gate.dto';
+import { ControlOrchestrationDto } from './dto/control-orchestration.dto';
 import { AddProjectMemberDto } from './dto/project-member.dto';
 import { UpdateProjectDto } from './dto/update-project.dto';
 import { ShareArtifactDto } from './dto/share-artifact.dto';
@@ -31,6 +32,7 @@ import { CreateProjectTaskDto, UpdateProjectTaskDto } from './dto/project-task.d
 import { AddTaskCommentDto } from './dto/task-comment.dto';
 import { CreateWorkOrderDto, UpdateWorkOrderDto } from './dto/work-order.dto';
 import { UpdateProjectKickoffDto } from './dto/project-kickoff.dto';
+import { AutoAnalyzeBriefDto } from './dto/auto-analyze-brief.dto';
 import { CurrentUser } from '../auth/current-user.decorator';
 import { AuthUser } from '../auth/auth.types';
 import { Roles } from '../auth/roles.decorator';
@@ -87,6 +89,24 @@ export class ProjectsController {
   @Roles(UserRole.CLIENT, UserRole.PM, UserRole.DEV, UserRole.ADMIN)
   findAll(@CurrentUser() user: AuthUser, @Query() page?: CursorPageInput) {
     return this.projectsService.findAll(user, page);
+  }
+
+  @Post('auto-analyze')
+  @Roles(UserRole.PM, UserRole.ADMIN)
+  @HttpCode(HttpStatus.OK)
+  @UsePipes(new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true }))
+  autoAnalyzeBrief(
+    @Body() dto: AutoAnalyzeBriefDto,
+    @CurrentUser() user: AuthUser,
+    @Headers('idempotency-key') idempotencyKey?: string,
+  ) {
+    return this.runIdempotent(
+      idempotencyKey,
+      `user:${user.id}:POST:/projects/auto-analyze`,
+      dto,
+      HttpStatus.OK,
+      () => this.projectsService.autoAnalyzeBrief(user, dto),
+    );
   }
 
   @Get('details')
@@ -644,6 +664,18 @@ export class ProjectsController {
   @HttpCode(HttpStatus.ACCEPTED)
   rerunReadyWorkOrders(@Param('id') id: string, @CurrentUser() user: AuthUser) {
     return this.projectsService.rerunReadyWorkOrders(id, user);
+  }
+
+  @Post(':id/orchestration/control')
+  @Roles(UserRole.PM, UserRole.ADMIN)
+  @HttpCode(HttpStatus.OK)
+  @UsePipes(new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true }))
+  controlOrchestration(
+    @Param('id') id: string,
+    @Body() dto: ControlOrchestrationDto,
+    @CurrentUser() user: AuthUser,
+  ) {
+    return this.projectsService.controlOrchestration(id, user, dto);
   }
 
   @Post(':id/gates/architecture')

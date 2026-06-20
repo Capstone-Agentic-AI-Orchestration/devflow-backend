@@ -205,12 +205,8 @@ describe('GraphLlmProvider', () => {
     expect(fetchMock.mock.calls[0][0]).toBe('https://opencode.ai/zen/go/v1/chat/completions');
     expect(fetchMock.mock.calls[0][1].headers.Authorization).toBe('Bearer test-opencode-key');
     const body = JSON.parse(fetchMock.mock.calls[0][1].body);
-    expect(body.response_format).toEqual(expect.objectContaining({
-      type: 'json_schema',
-      json_schema: expect.objectContaining({
-        schema: expect.objectContaining({ type: 'array' }),
-      }),
-    }));
+    // OpenCode/DeepSeek does not support json_schema response format
+    expect(body.response_format).toBeUndefined();
   });
 
   it('verifies the active graph LLM provider with a minimal request', async () => {
