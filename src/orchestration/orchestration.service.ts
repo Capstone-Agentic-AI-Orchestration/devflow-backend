@@ -319,6 +319,21 @@ export class OrchestrationService implements OnModuleInit {
       );
     }
 
+    // Fetch global memory context so the analyzer can learn from past brief
+    // analyses — successful project patterns, common feature groupings, and
+    // past mistakes to avoid — even before a project is created.
+    const memoryQuery = [
+      input.stackKey,
+      input.brief.slice(0, 200),
+      'brief analysis requirements',
+    ].filter(Boolean).join(' ');
+
+    const memoryContext = await this.memory.readRelevant('requirements', memoryQuery, 3).catch(() => []);
+
+    const contextBlock = memoryContext.length > 0
+      ? `\n\nContext from similar past analyses:\n${this.memory.formatAsContext(memoryContext)}`
+      : '';
+
     const systemPrompt = `You are a product analyst helping a PM turn a rough idea into a structured project brief.
 Return a valid JSON object with this exact shape:
 {
@@ -340,7 +355,7 @@ Rules:
 - suggestedTechStack: Infer from the stack key hint; use sensible defaults if not clear.
 - complexity: "simple" for <4 features, "medium" for 4-7, "complex" for 8+.
 - estimatedFiles: Rough file count based on features and complexity.
-Respond ONLY with the JSON object — no markdown fences, no prose.`;
+Respond ONLY with the JSON object — no markdown fences, no prose.${contextBlock}`;
 
     const userPrompt = `Analyze this project idea and produce a structured brief.
 
@@ -1097,7 +1112,7 @@ Rough idea: ${input.brief}`;
           clientVisible: false,
           validationStatus: ArtifactValidationStatus.PASSED,
           validationSummary: validation.summary,
-          validationErrors: validation.errors,
+          validationErrors: validation.errors as unknown as Prisma.InputJsonValue,
         },
       });
 
@@ -1157,8 +1172,8 @@ Rough idea: ${input.brief}`;
             },
             validation: {
               summary: validation.summary,
-              errors: validation.errors,
-            },
+              errors: validation.errors as unknown as Prisma.InputJsonValue,
+            } satisfies Prisma.InputJsonValue,
           },
           runTokens: 0,
           occurredAt: completedAt,
@@ -1185,8 +1200,8 @@ Rough idea: ${input.brief}`;
               },
               validation: {
                 summary: validation.summary,
-                errors: validation.errors,
-              },
+                errors: validation.errors as unknown as Prisma.InputJsonValue,
+              } satisfies Prisma.InputJsonValue,
             },
           },
         }),

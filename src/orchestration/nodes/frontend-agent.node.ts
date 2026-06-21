@@ -40,6 +40,7 @@ export class FrontendAgentNode {
     await this.eventLog.logStarted(projectId, 'frontend_agent');
 
     this.streamEmitter.emit(projectId, 'frontend_agent', runId ?? '', 'decision', 'Starting frontend code generation...');
+    this.streamEmitter.progress(projectId, 'frontend_agent', runId ?? '', 10, 'Loading context');
 
     try {
       const memoryQuery = [
@@ -131,6 +132,7 @@ export class FrontendAgentNode {
         return { artifacts, validationFeedback: null };
       }
 
+      this.streamEmitter.progress(projectId, 'frontend_agent', runId ?? '', 40, `Generating ${allFrontendFiles.length} files`);
       this.streamEmitter.emit(projectId, 'frontend_agent', runId ?? '', 'decision', `Calling LLM (${this.graphLlm.model()}) to generate frontend code for ${allFrontendFiles.length} files...`);
 
       const artifactManifest = (state.artifacts ?? [])
@@ -205,6 +207,7 @@ Generate complete, production-quality code for each file. Config files (package.
         this.logger.warn(`[${state.projectId}] Artifact persist failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
       });
 
+      this.streamEmitter.progress(projectId, 'frontend_agent', runId ?? '', 95, 'Saving artifacts');
       this.streamEmitter.emit(projectId, 'frontend_agent', runId ?? '', 'decision', `Frontend generation complete: ${artifacts.length} files generated (${result.usage.outputTokens} output tokens)`);
 
       return { artifacts, validationFeedback: null };

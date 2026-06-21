@@ -10,6 +10,7 @@ import { humanReadableError } from './human-readable-error';
 import { DATABASE_AGENT_SYSTEM, buildAgentSystemPrompt } from '../prompts/agent-prompts';
 import { resolveModelForNode } from '../providers/base-llm.provider';
 import { ProjectScaffolderService } from '../scaffolding/project-scaffolder.service';
+import { OutputValidationService } from '../output-validation/output-validation.service';
 
 @Injectable()
 export class DatabaseAgentNode {
@@ -22,6 +23,7 @@ export class DatabaseAgentNode {
     private readonly graphLlm: GraphLlmProvider,
     private readonly streamEmitter: StreamEmitter,
     private readonly scaffolder: ProjectScaffolderService,
+    private readonly outputValidation: OutputValidationService,
   ) {}
 
   async execute(
@@ -38,6 +40,7 @@ export class DatabaseAgentNode {
     await this.eventLog.logStarted(projectId, 'database_agent');
 
     this.streamEmitter.emit(projectId, 'database_agent', runId ?? '', 'decision', 'Starting database schema generation...');
+    this.streamEmitter.progress(projectId, 'database_agent', runId ?? '', 10, 'Loading context');
 
     try {
       const memoryQuery = [
@@ -83,12 +86,8 @@ export class DatabaseAgentNode {
           state.contract.acceptanceCriteria,
         );
         if (isValid) {
-          this.logger.log(
-            `[${state.projectId}] Skip-generation: reusing database memory artifact (similarity=${skipCandidate.similarity?.toFixed(3)})`,
-          );
-          await this.memory.bumpUsageStats(skipCandidate.id);
           const rememberedFilePath = skipCandidate.metadata['filePath'];
-          const artifact: GeneratedArtifact = {
+          const candidateArtifact: GeneratedArtifact = {
             agentType: 'database',
             filePath:
               typeof rememberedFilePath === 'string'
@@ -98,7 +97,17 @@ export class DatabaseAgentNode {
             language: 'prisma',
             source: 'skip',
           };
-          return { artifacts: this.mergeWithScaffold([artifact], state), validationFeedback: null };
+          const validationErrors = this.outputValidation.validateBatch([candidateArtifact], state.projectId);
+          if (validationErrors.length === 0) {
+            this.logger.log(
+              `[${state.projectId}] Skip-generation: reusing database memory artifact (similarity=${skipCandidate.similarity?.toFixed(3)})`,
+            );
+            await this.memory.bumpUsageStats(skipCandidate.id);
+            return { artifacts: this.mergeWithScaffold([candidateArtifact], state), validationFeedback: null };
+          }
+          this.logger.warn(
+            `[${state.projectId}] Skip candidate failed content validation (${validationErrors.length} errors), falling through to LLM generation`,
+          );
         }
         this.logger.log(
           `[${state.projectId}] Skip candidate failed acceptance validation, proceeding with LLM generation`,
@@ -121,6 +130,7 @@ export class DatabaseAgentNode {
         return { artifacts, validationFeedback: null };
       }
 
+      this.streamEmitter.progress(projectId, 'database_agent', runId ?? '', 40, `Generating ${allDbFiles.length} files`);
       this.streamEmitter.emit(projectId, 'database_agent', runId ?? '', 'decision', `Calling LLM (${this.graphLlm.model()}) to generate database schema for ${allDbFiles.length} files...`);
 
       const feedbackContext = state.validationFeedback
@@ -192,6 +202,7 @@ Requirements:
         skipDuplicates: true,
       }).catch(() => {});
 
+      this.streamEmitter.progress(projectId, 'database_agent', runId ?? '', 95, 'Saving artifacts');
       this.streamEmitter.emit(projectId, 'database_agent', runId ?? '', 'decision', `Database generation complete: ${artifacts.length} files generated (${result.usage.outputTokens} output tokens)`);
 
       return { artifacts, validationFeedback: null };

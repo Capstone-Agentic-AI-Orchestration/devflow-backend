@@ -261,4 +261,97 @@ describe('RunSupervisorService', () => {
 
     await expect(service.supervisorTick()).resolves.toBeUndefined();
   });
+
+  it('does nothing when no stuck projects are found', async () => {
+    // $queryRaw already returns [] by default from makePrismaMock
+    await service.supervisorTick();
+
+    expect(orchestration.recoverStaleProject).not.toHaveBeenCalled();
+    expect(eventLog.logEscalated).not.toHaveBeenCalled();
+    expect(eventLog.logStuck).not.toHaveBeenCalled();
+  });
+
+  it('escalates when token budget is exhausted even when retries remain', async () => {
+    prisma.$queryRaw.mockResolvedValue([
+      {
+        id: 'project-budget-exhausted',
+        status: ProjectStatus.GENERATING_CODE,
+        retryCount: 1,
+        maxRetries: 5,
+        tokensConsumed: 1000,
+        tokenBudget: 1000,
+      },
+    ]);
+
+    await service.supervisorTick();
+
+    expect(eventLog.logEscalated).toHaveBeenCalledWith(
+      'project-budget-exhausted',
+      'supervisor',
+      expect.stringContaining('Token budget exhausted'),
+    );
+    expect(prisma.project.update).toHaveBeenCalledWith({
+      where: { id: 'project-budget-exhausted' },
+      data: { status: ProjectStatus.FAILED },
+    });
+    expect(orchestration.recoverStaleProject).not.toHaveBeenCalled();
+  });
+
+  it('falls back gracefully when budget info is unavailable during escalation', async () => {
+    prisma.$queryRaw.mockResolvedValue([
+      {
+        id: 'project-no-budget',
+        status: ProjectStatus.COMMITTING,
+        retryCount: 3,
+        maxRetries: 3,
+        tokensConsumed: 0,
+        tokenBudget: 0,
+      },
+    ]);
+
+    await service.supervisorTick();
+
+    expect(eventLog.logEscalated).toHaveBeenCalled();
+    expect(prisma.project.update).toHaveBeenCalled();
+  });
+
+  it('handles recovery run failure without throwing', async () => {
+    orchestration.recoverStaleProject.mockRejectedValue(new Error('recovery crashed'));
+    prisma.$queryRaw.mockResolvedValue([
+      {
+        id: 'project-recovery-fail',
+        status: ProjectStatus.GENERATING_CODE,
+        retryCount: 0,
+        maxRetries: 3,
+        tokensConsumed: 100,
+        tokenBudget: 1000,
+      },
+    ]);
+
+    await expect(service.supervisorTick()).resolves.toBeUndefined();
+    expect(eventLog.logStuck).toHaveBeenCalled();
+  });
+
+  it('converts raw bigint rows from the database query', async () => {
+    // Simulate PostgreSQL returning bigint types for numeric columns
+    prisma.$queryRaw.mockResolvedValue([
+      {
+        id: 'project-bigint',
+        status: ProjectStatus.PARSING_REQUIREMENTS,
+        retryCount: BigInt(0),
+        maxRetries: BigInt(3),
+        tokensConsumed: BigInt(50),
+        tokenBudget: BigInt(500),
+      },
+    ]);
+
+    await service.supervisorTick();
+
+    expect(prisma.runBudget.update).toHaveBeenCalled();
+    expect(eventLog.logStuck).toHaveBeenCalled();
+    expect(orchestration.recoverStaleProject).toHaveBeenCalledWith(
+      'project-bigint',
+      expect.objectContaining({ retryAttempt: 1, maxRetries: 3 }),
+    );
+  });
 });

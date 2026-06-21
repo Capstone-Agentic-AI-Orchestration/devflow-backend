@@ -29,6 +29,16 @@ export class StreamEmitter {
     @Optional() private readonly emitter: OrchestrationEmitter | null,
   ) {}
 
+  /**
+   * Emit a fine-grained progress checkpoint for a node (e.g. "40% — calling
+   * LLM"). Routed straight to the typed `node.progress` channel — not batched,
+   * since checkpoints are coarse and order matters. No-op when no typed emitter
+   * is wired (tests / CLI), mirroring the agent-stream path.
+   */
+  progress(projectId: string, nodeId: string, runId: string, pct?: number, label?: string): void {
+    this.emitter?.nodeProgress(projectId, runId ?? '', nodeId, pct, label);
+  }
+
   emit(projectId: string, nodeId: string, runId: string, type: StreamChunk['type'], chunk: string, metadata?: Record<string, unknown>): void {
     const key = `${projectId}:${nodeId}`;
     const entry: StreamChunk = { nodeId, runId, type, chunk, metadata };

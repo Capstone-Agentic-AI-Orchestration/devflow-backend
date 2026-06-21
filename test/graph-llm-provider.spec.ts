@@ -465,6 +465,7 @@ describe('LangGraph OpenRouter-backed agents', () => {
     };
     const memory = {
       writeSkill: vi.fn().mockResolvedValue({}),
+      buildContextForAgent: vi.fn().mockResolvedValue({ context: '', total: 0 }),
     };
 
     const mockStreamEmitter = {
@@ -534,12 +535,28 @@ describe('LangGraph OpenRouter-backed agents', () => {
       logCompleted: vi.fn().mockResolvedValue({}),
     };
 
+    const scaffolder = {
+      scaffold: vi.fn().mockReturnValue([
+        { agentType: 'frontend', filePath: 'src/app/layout.tsx', content: '', language: 'tsx' },
+        { agentType: 'frontend', filePath: 'src/components/ui/Button.tsx', content: '', language: 'tsx' },
+        { agentType: 'frontend', filePath: 'src/components/ui/Card.tsx', content: '', language: 'tsx' },
+        { agentType: 'frontend', filePath: 'src/styles/globals.css', content: '', language: 'css' },
+        { agentType: 'frontend', filePath: 'README-frontend.md', content: '', language: 'markdown' },
+      ]),
+      merge: vi.fn().mockImplementation((llm: { filePath: string; content: string; language: string; agentType: string }[], scaffold: { filePath: string; content: string; language: string; agentType: string }[], _type: string) => [...llm, ...scaffold]),
+    };
+    const outputValidation = {
+      validateBatch: vi.fn().mockReturnValue([]),
+    };
+
     const node = new FrontendAgentNode(
       prisma as never,
       memory as never,
       eventLog as never,
       graphLlm as unknown as GraphLlmProvider,
       mockStreamEmitter2 as never,
+      scaffolder as never,
+      outputValidation as never,
     );
     const result = await node.execute({
       projectId: 'project-1',
@@ -582,14 +599,16 @@ describe('LangGraph OpenRouter-backed agents', () => {
       },
     } as unknown as DevFlowStateType);
 
-    expect(result.artifacts).toEqual(expect.arrayContaining([
-      {
-        agentType: 'frontend',
-        filePath: 'src/app/page.tsx',
-        content: 'export default function Page() { return <section><div>App</div></section>; }',
-        language: 'tsx',
-      },
-    ]));
+    expect(result.artifacts).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          agentType: 'frontend',
+          filePath: 'src/app/page.tsx',
+          content: 'export default function Page() { return <section><div>App</div></section>; }',
+          language: 'tsx',
+        }),
+      ]),
+    );
     expect(result.artifacts?.map((artifact) => artifact.filePath)).toEqual(
       expect.arrayContaining([
         'src/app/page.tsx',

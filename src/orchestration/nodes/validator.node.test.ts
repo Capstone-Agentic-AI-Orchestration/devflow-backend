@@ -23,7 +23,7 @@ function contract(fileManifest: string[]): ProjectContract {
 
 function makeNode() {
   const memory = { writeMistake: vi.fn().mockResolvedValue(undefined) };
-  const streamEmitter = { emit: vi.fn() };
+  const streamEmitter = { emit: vi.fn(), progress: vi.fn() };
   const node = new ValidatorNode(
     memory as never,
     streamEmitter as never,

@@ -10,6 +10,7 @@ import { humanReadableError } from './human-readable-error';
 import { BACKEND_AGENT_SYSTEM, buildAgentSystemPrompt } from '../prompts/agent-prompts';
 import { resolveModelForNode } from '../providers/base-llm.provider';
 import { ProjectScaffolderService } from '../scaffolding/project-scaffolder.service';
+import { OutputValidationService } from '../output-validation/output-validation.service';
 
 @Injectable()
 export class BackendAgentNode {
@@ -22,6 +23,7 @@ export class BackendAgentNode {
     private readonly graphLlm: GraphLlmProvider,
     private readonly streamEmitter: StreamEmitter,
     private readonly scaffolder: ProjectScaffolderService,
+    private readonly outputValidation: OutputValidationService,
   ) {}
 
   async execute(
@@ -38,6 +40,7 @@ export class BackendAgentNode {
     await this.eventLog.logStarted(projectId, 'backend_agent');
 
     this.streamEmitter.emit(projectId, 'backend_agent', runId ?? '', 'decision', 'Starting backend code generation...');
+    this.streamEmitter.progress(projectId, 'backend_agent', runId ?? '', 10, 'Loading context');
 
     try {
       const memoryQuery = [
@@ -88,12 +91,8 @@ export class BackendAgentNode {
           state.contract.acceptanceCriteria,
         );
         if (isValid) {
-          this.logger.log(
-            `[${state.projectId}] Skip-generation: reusing backend memory artifact (similarity=${skipCandidate.similarity?.toFixed(3)})`,
-          );
-          await this.memory.bumpUsageStats(skipCandidate.id);
           const rememberedFilePath = skipCandidate.metadata['filePath'];
-          const artifact: GeneratedArtifact = {
+          const candidateArtifact: GeneratedArtifact = {
             agentType: 'backend',
             filePath:
               typeof rememberedFilePath === 'string'
@@ -103,8 +102,17 @@ export class BackendAgentNode {
             language: 'typescript',
             source: 'skip',
           };
-          return { artifacts: this.mergeWithScaffold([artifact], state), validationFeedback: null };
-
+          const validationErrors = this.outputValidation.validateBatch([candidateArtifact], state.projectId);
+          if (validationErrors.length === 0) {
+            this.logger.log(
+              `[${state.projectId}] Skip-generation: reusing backend memory artifact (similarity=${skipCandidate.similarity?.toFixed(3)})`,
+            );
+            await this.memory.bumpUsageStats(skipCandidate.id);
+            return { artifacts: this.mergeWithScaffold([candidateArtifact], state), validationFeedback: null };
+          }
+          this.logger.warn(
+            `[${state.projectId}] Skip candidate failed content validation (${validationErrors.length} errors), falling through to LLM generation`,
+          );
         }
         this.logger.log(
           `[${state.projectId}] Skip candidate failed acceptance validation, proceeding with LLM generation`,
@@ -126,6 +134,7 @@ export class BackendAgentNode {
         await this.eventLog.logCompleted(state.projectId, 'backend_agent', { inputTokens: 0, outputTokens: 0, model: 'mock' });
         return { artifacts, validationFeedback: null };
       }
+      this.streamEmitter.progress(projectId, 'backend_agent', runId ?? '', 40, `Generating ${allBackendFiles.length} files`);
       this.streamEmitter.emit(projectId, 'backend_agent', runId ?? '', 'decision', `Calling LLM (${this.graphLlm.model()}) to generate backend code for ${allBackendFiles.length} files...`);
 
       const artifactManifest = (state.artifacts ?? [])
@@ -205,6 +214,7 @@ Generate complete NestJS code with:
         this.logger.warn(`[${state.projectId}] Artifact persist failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
       });
 
+      this.streamEmitter.progress(projectId, 'backend_agent', runId ?? '', 95, 'Saving artifacts');
       this.streamEmitter.emit(projectId, 'backend_agent', runId ?? '', 'decision', `Backend generation complete: ${artifacts.length} files generated (${result.usage.outputTokens} output tokens)`);
 
       return { artifacts, validationFeedback: null };

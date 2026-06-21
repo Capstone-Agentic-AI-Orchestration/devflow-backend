@@ -287,21 +287,83 @@ export class MemoryService {
   }
 
   formatLayeredContext(layers: LayeredAgentMemories): string {
-    const sections = [
-      this.formatSection('PROJECT CORE MEMORY (approved shared project truth)', layers.projectCore),
-      this.formatSection('PROJECT-SPECIFIC AGENT MEMORY', layers.projectAgent),
-      this.formatSection('AGENT PRIVATE MEMORY', layers.agentPrivate),
-      this.formatSection('KNOWN MISTAKES TO AVOID', layers.mistakes),
-      this.formatSection('GLOBAL APPROVED PATTERNS', layers.globalPatterns),
-    ].filter(Boolean);
+    const mistakesByAgent = this.groupMistakesByAgent(layers.mistakes);
+    const sections: string[] = [];
+
+    if (layers.projectCore.length > 0) {
+      sections.push(
+        `### SHARED PROJECT TRUTH (approved — follow these decisions):`,
+        ...layers.projectCore.map((m) =>
+          `• ${m.content.slice(0, 500)}${m.content.length > 500 ? '...' : ''}`,
+        ),
+      );
+    }
+
+    if (layers.projectAgent.length > 0) {
+      sections.push(
+        `### YOUR PAST WORK ON THIS PROJECT (maintain consistency):`,
+        ...layers.projectAgent.map((m) =>
+          `• [${m.memoryType}] ${m.content.slice(0, 500)}${m.content.length > 500 ? '...' : ''}`,
+        ),
+      );
+    }
+
+    if (layers.agentPrivate.length > 0) {
+      sections.push(
+        `### YOUR PROVEN SKILLS (relevant techniques to reuse):`,
+        ...layers.agentPrivate.map((m) =>
+          `• ${m.content.slice(0, 500)}${m.content.length > 500 ? '...' : ''}`,
+        ),
+      );
+    }
+
+    if (mistakesByAgent.length > 0) {
+      sections.push(
+        `### MISTAKES TO AVOID (you made these errors before — do NOT repeat them):`,
+        ...mistakesByAgent,
+      );
+    }
+
+    if (layers.globalPatterns.length > 0) {
+      sections.push(
+        `### GLOBAL APPROVED PATTERNS (industry best practices verified for this stack):`,
+        ...layers.globalPatterns.map((m) =>
+          `• ${m.content.slice(0, 500)}${m.content.length > 500 ? '...' : ''}`,
+        ),
+      );
+    }
 
     if (sections.length === 0) return '';
 
     return [
-      '--- LAYERED AGENT MEMORY CONTEXT (injected - do not reproduce verbatim) ---',
+      '--- LAYERED AGENT MEMORY CONTEXT (injected guidance - do not output verbatim) ---',
       ...sections,
-      '--- END LAYERED AGENT MEMORY CONTEXT ---',
+      '--- END MEMORY CONTEXT ---',
     ].join('\n\n');
+  }
+
+  /**
+   * Groups mistakes by root cause and formats them as actionable "avoid X, instead do Y"
+   * guidance rather than raw rejection dumps.
+   */
+  private groupMistakesByAgent(mistakes: MemoryRecord[]): string[] {
+    const byAgent = new Map<string, string[]>();
+    for (const m of mistakes) {
+      const label = `[REJECTED by ${m.metadata?.gateType ?? 'validator'}]`;
+      const existing = byAgent.get(m.agentType) ?? [];
+      const snippet = m.content.includes('REJECTION REASON:')
+        ? m.content.split('REJECTED CONTENT:')[0]?.replace('REJECTION REASON:', 'Cause:').trim()
+        : m.content.slice(0, 300);
+      existing.push(`${label} ${snippet}`);
+      byAgent.set(m.agentType, existing);
+    }
+
+    const lines: string[] = [];
+    for (const [agent, issues] of byAgent) {
+      lines.push(`  Agent: ${agent}`);
+      issues.forEach((issue, i) => lines.push(`    ${i + 1}. ${issue}`));
+    }
+    return lines;
   }
 
   // Writes
@@ -457,6 +519,7 @@ export class MemoryService {
     projectId?: string,
   ): Promise<MemoryRecord | null> {
     try {
+      const topK = 3;
       const results = projectId
         ? await this.queryMemories(
             fileQuery,
@@ -469,21 +532,41 @@ export class MemoryService {
               )
               AND ("expiresAt" IS NULL OR "expiresAt" > NOW())
             `,
-            1,
+            topK,
           )
-        : await this.readRelevant(agentType, fileQuery, 1);
-      const top = results[0];
+        : await this.readRelevant(agentType, fileQuery, topK);
 
-      if (
-        top &&
-        top.memoryType === 'SKILL' &&
-        (top.similarity ?? 0) >= MemoryService.SKIP_THRESHOLD &&
-        top.metadata['stackKey'] === stackKey
-      ) {
+      // Score candidates by a weighted combination of similarity, usage count,
+      // and recency — then pick the best that clears the threshold.
+      const now = Date.now();
+      const scored = results
+        .filter((r) => r.memoryType === 'SKILL' && r.metadata?.['stackKey'] === stackKey)
+        .map((r) => {
+          const similarity = r.similarity ?? 0;
+          const usageBoost = Math.min((r.usageCount ?? 0) / 10, 0.05);
+          const recencyDays = r.lastUsedAt
+            ? (now - r.lastUsedAt.getTime()) / (1000 * 60 * 60 * 24)
+            : 90;
+          const recencyBoost = Math.max(0, 0.03 * (1 - recencyDays / 90));
+          const combinedScore = similarity + usageBoost + recencyBoost;
+          return { record: r, score: combinedScore };
+        })
+        .sort((a, b) => b.score - a.score);
+
+      const best = scored[0];
+      if (best && best.score >= MemoryService.SKIP_THRESHOLD) {
         this.logger.log(
-          `Skip-generation candidate found for ${agentType}/${fileQuery} (similarity=${top.similarity?.toFixed(3)})`,
+          `Skip-generation candidate found for ${agentType}/${fileQuery} ` +
+          `(similarity=${best.record.similarity?.toFixed(3)}, score=${best.score.toFixed(3)}, ` +
+          `usage=${best.record.usageCount ?? 0}, stack=${stackKey})`,
         );
-        return top;
+        return best.record;
+      }
+
+      if (scored.length > 0 && best) {
+        this.logger.debug(
+          `No skip candidate for ${agentType}/${fileQuery}: best score ${best.score.toFixed(3)} below threshold ${MemoryService.SKIP_THRESHOLD}`,
+        );
       }
 
       return null;

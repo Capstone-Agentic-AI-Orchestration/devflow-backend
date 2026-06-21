@@ -81,7 +81,7 @@ function makePrismaMock() {
     },
     artifact: {
       createMany: vi.fn().mockResolvedValue({ count: 0 }),
-      create: vi.fn(),
+      create: vi.fn().mockResolvedValue({ id: 'artifact-1' }),
     },
     workOrder: {
       findFirst: vi.fn(),
@@ -259,6 +259,7 @@ describe('OrchestrationService', () => {
       githubCommit as unknown as GithubCommitNode,
       memory as unknown as MemoryService,
       new ArtifactContractValidator(),
+      { validate: vi.fn().mockReturnValue({ valid: true, errors: [], summary: 'FRONTEND artifact contract mock-work-order-v1 passed' }), validateBatch: vi.fn().mockReturnValue([]) } as never,
       agentProviderRegistry,
       notifications as unknown as NotificationsService,
       github as unknown as GithubService,
@@ -1301,6 +1302,11 @@ describe('OrchestrationService', () => {
       },
       artifact: null,
     });
+    // Override the output validation mock per-test to reject invalid output.
+    const outputValidationMock = { validate: vi.fn(), validateBatch: vi.fn().mockReturnValue([]) };
+    (service as unknown as { outputValidation: typeof outputValidationMock }).outputValidation = outputValidationMock;
+    outputValidationMock.validate.mockReturnValue({ valid: false, errors: [{ code: 'BASE', message: 'content must be at least 40 non-empty characters' }], summary: 'FRONTEND output failed' });
+
     vi.spyOn(mockAgentProvider, 'generateWorkOrderOutput').mockReturnValueOnce({
       filePath: 'bad-output.txt',
       displayName: 'Bad output',
@@ -1310,21 +1316,21 @@ describe('OrchestrationService', () => {
 
     await expect(
       service.executeWorkOrder('test-project-id', 'work-order-1', 'pm-1'),
-    ).rejects.toThrow('Artifact contract validation failed');
+    ).rejects.toThrow('Output validation failed');
 
     expect(prisma.artifact.create).not.toHaveBeenCalled();
     expect(prisma.workOrder.update).toHaveBeenCalledWith({
       where: { id: 'work-order-1' },
       data: expect.objectContaining({
         status: WorkOrderStatus.FAILED,
-        executionError: expect.stringContaining('Artifact contract validation failed'),
+        executionError: expect.stringContaining('Output validation failed'),
       }),
     });
     expect(prisma.workOrderExecution.update).toHaveBeenCalledWith({
       where: { executionRunId: expect.any(String) },
       data: expect.objectContaining({
         status: 'FAILED',
-        error: expect.stringContaining('Artifact contract validation failed'),
+        error: expect.stringContaining('Output validation failed'),
       }),
     });
   });

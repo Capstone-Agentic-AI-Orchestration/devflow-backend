@@ -5,6 +5,7 @@ import {
   DevFlowStateType,
   RequirementsDocument,
 } from '../graph/devflow.state';
+import { NODE } from '../graph/topology';
 import { GraphLlmProvider } from '../providers/graph-llm.provider';
 import { StreamEmitter } from '../streaming/stream-emitter.service';
 import { humanReadableError } from './human-readable-error';
@@ -30,7 +31,8 @@ export class RequirementsParserNode {
     const { projectId, runId } = state;
     this.logger.log(`[${projectId}] Parsing requirements`);
 
-    this.streamEmitter.emit(projectId, 'requirements_parser', runId ?? '', 'decision', 'Analyzing project brief to extract structured requirements...');
+    this.streamEmitter.emit(projectId, NODE.PARSE_REQUIREMENTS, runId ?? '', 'decision', 'Analyzing project brief to extract structured requirements...');
+    this.streamEmitter.progress(projectId, NODE.PARSE_REQUIREMENTS, runId ?? '', 10, 'Analyzing brief');
 
     try {
       await this.prisma.project.update({
@@ -38,7 +40,21 @@ export class RequirementsParserNode {
         data: { status: 'PARSING_REQUIREMENTS' },
       });
 
-      this.streamEmitter.emit(projectId, 'requirements_parser', runId ?? '', 'decision', `Reading project memories for stack key "${state.stackKey}"`);
+      this.streamEmitter.emit(projectId, NODE.PARSE_REQUIREMENTS, runId ?? '', 'decision', `Reading project memories for stack key "${state.stackKey}"`);
+
+      // Fetch layered memory context so the parser can learn from past
+      // requirements parses, patterns, and mistakes for similar projects.
+      const memoryQuery = [
+        state.stackKey,
+        state.brief?.slice(0, 200),
+        'requirements parsing',
+      ].filter(Boolean).join(' ');
+
+      const memoryBundle = await this.memory.buildContextForAgent({
+        agentType: 'requirements',
+        projectId: state.projectId,
+        query: memoryQuery,
+      });
 
       const prompt = `You are a software architect analyzing a project brief to extract structured requirements.
 
@@ -47,7 +63,9 @@ ${state.brief}
 
 Preferred Stack Key: ${state.stackKey}
 
-Analyze this brief and produce a structured requirements document. Base the tech stack on the stack key hint, but infer reasonable defaults if not specified.`;
+Analyze this brief and produce a structured requirements document. Base the tech stack on the stack key hint, but infer reasonable defaults if not specified.
+
+${memoryBundle.context ? `Context from similar past requirements:\n${memoryBundle.context}` : ''}`;
 
       // Mock Mode bypass
       if (process.env.MOCK_MODE === 'true') {
@@ -63,15 +81,16 @@ Analyze this brief and produce a structured requirements document. Base the tech
           complexity: 'simple',
           estimatedFiles: 5,
         };
-        this.streamEmitter.emit(projectId, 'requirements_parser', runId ?? '', 'decision', 'Mock mode: returning predefined requirements');
+        this.streamEmitter.emit(projectId, NODE.PARSE_REQUIREMENTS, runId ?? '', 'decision', 'Mock mode: returning predefined requirements');
         return { requirements, complexity: 'simple' };
       }
 
-      this.streamEmitter.emit(projectId, 'requirements_parser', runId ?? '', 'decision', `Calling LLM (${this.graphLlm.model()}) to parse requirements...`);
+      this.streamEmitter.emit(projectId, NODE.PARSE_REQUIREMENTS, runId ?? '', 'decision', `Calling LLM (${this.graphLlm.model()}) to parse requirements...`);
+      this.streamEmitter.progress(projectId, NODE.PARSE_REQUIREMENTS, runId ?? '', 35, 'Calling LLM');
 
       const result = await this.graphLlm.generateJson<Partial<RequirementsDocument>>({
         agentName: resolveModelForNode('parse_requirements', 'requirements_parser'),
-        onToken: (delta) => this.streamEmitter.emit(projectId, 'requirements_parser', runId ?? '', 'token', delta),
+        onToken: (delta) => this.streamEmitter.emit(projectId, NODE.PARSE_REQUIREMENTS, runId ?? '', 'token', delta),
         systemPrompt: REQUIREMENTS_PARSER_SYSTEM,
         userPrompt: prompt,
         expectedShape: 'object',
@@ -132,7 +151,8 @@ Analyze this brief and produce a structured requirements document. Base the tech
       // This builds the memory store's understanding of how briefs map to parsed
       // requirements for a given stack + project type. Future runs can reference
       // these entries to self-correct their own parsing output.
-      this.streamEmitter.emit(projectId, 'requirements_parser', runId ?? '', 'tool-call', 'Writing requirements to memory store', { operation: 'writeSkill', agentType: 'requirements' });
+      this.streamEmitter.progress(projectId, NODE.PARSE_REQUIREMENTS, runId ?? '', 85, 'Saving requirements');
+      this.streamEmitter.emit(projectId, NODE.PARSE_REQUIREMENTS, runId ?? '', 'tool-call', 'Writing requirements to memory store', { operation: 'writeSkill', agentType: 'requirements' });
 
       await this.memory.writeSkill({
         agentType: 'requirements',
@@ -144,14 +164,14 @@ Analyze this brief and produce a structured requirements document. Base the tech
         projectType: requirements.projectType,
       });
 
-      this.streamEmitter.emit(projectId, 'requirements_parser', runId ?? '', 'decision', `Requirements parsed: ${requirements.complexity} complexity, ${requirements.estimatedFiles} estimated files, ${requirements.features.length} features`);
+      this.streamEmitter.emit(projectId, NODE.PARSE_REQUIREMENTS, runId ?? '', 'decision', `Requirements parsed: ${requirements.complexity} complexity, ${requirements.estimatedFiles} estimated files, ${requirements.features.length} features`);
 
       return { requirements, complexity };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       this.logger.error(`[${projectId}] Requirements parsing failed: ${message}`);
 
-      this.streamEmitter.emit(projectId, 'requirements_parser', runId ?? '', 'error', `Requirements parsing failed: ${humanReadableError(message)}`);
+      this.streamEmitter.emit(projectId, NODE.PARSE_REQUIREMENTS, runId ?? '', 'error', `Requirements parsing failed: ${humanReadableError(message)}`);
 
       await this.prisma.project
         .update({

@@ -58,6 +58,11 @@ describe('GithubService', () => {
     }));
     service.onModuleInit();
     const octokit = {
+      apps: {
+        getInstallation: vi.fn().mockResolvedValue({
+          data: { account: { type: 'Organization' } },
+        }),
+      },
       repos: {
         createInOrg: vi.fn().mockResolvedValue({
           data: { clone_url: 'https://github.com/capstone-org/acme-project.git' },
@@ -73,7 +78,6 @@ describe('GithubService', () => {
       org: 'capstone-org',
       name: 'acme-project',
       private: true,
-      auto_init: true,
       description: 'Scaffolded by DevFlow',
     });
     expect(service.getDeliveryStatus()).toEqual(expect.objectContaining({
@@ -95,6 +99,9 @@ describe('GithubService', () => {
     }));
     service.onModuleInit();
     const octokit = {
+      repos: {
+        get: vi.fn().mockResolvedValue({ data: { default_branch: 'main' } }),
+      },
       git: {
         getRef: vi.fn().mockResolvedValue({ data: { object: { sha: 'latest-sha' } } }),
         getCommit: vi.fn().mockResolvedValue({ data: { tree: { sha: 'base-tree-sha' } } }),

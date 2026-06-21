@@ -1,10 +1,11 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { DevFlowStateType, RetryDirective } from '../graph/devflow.state';
+import { NODE } from '../graph/topology';
 import { MemoryService } from '../../memory/memory.service';
 import { StreamEmitter } from '../streaming/stream-emitter.service';
 import { humanReadableError } from './human-readable-error';
 import { OutputValidationService } from '../output-validation/output-validation.service';
-import type { ValidationError } from '../output-validation/schemas/schema.types';
+import type { ValidationError, ValidationErrorCode } from '../output-validation/schemas/schema.types';
 
 type AgentType = 'frontend' | 'backend' | 'database' | 'architecture';
 
@@ -24,7 +25,21 @@ interface ValidationResult {
 @Injectable()
 export class ValidatorNode {
   private readonly logger = new Logger(ValidatorNode.name);
-  private static readonly MAX_RETRIES = 3;
+  private static readonly MAX_RETRIES = 5;
+
+  /**
+   * Maps validation error codes to actionable fix suggestions, making retry
+   * directives more helpful than just "this is broken."
+   */
+  private static readonly FIX_SUGGESTIONS: Record<ValidationErrorCode, string> = {
+    TS_SYNTAX: 'Fix syntax: check for missing brackets, parens, semicolons, or trailing commas. Run the file through a TS parser before re-emitting.',
+    TS_TYPE: 'Fix type error: ensure all imported symbols exist, interfaces match their usage, and generic params satisfy their constraints.',
+    SQL_SYNTAX: 'Fix SQL: check keyword spelling, paren matching, and statement terminator placement.',
+    MD_SYNTAX: 'Fix markdown: ensure code blocks are fenced with triple backticks and headings have a space after #.',
+    SCHEMA_VIOLATION: 'Fix schema: ensure the artifact matches the required shape (file path prefix, content length, exports).',
+    BASE: 'Fix base: filePath, displayName, and content are all required with minimum lengths.',
+    CONTRACT: 'Fix integration seam: ensure frontend API calls match backend routes and backend Prisma calls match schema models.',
+  };
 
   constructor(
     private readonly memory: MemoryService,
@@ -41,19 +56,20 @@ export class ValidatorNode {
     );
 
     if (!state.contract) {
-      this.streamEmitter.emit(projectId, 'validator', runId ?? '', 'error', 'Validator skipped: contract is missing');
+      this.streamEmitter.emit(projectId, NODE.VALIDATE_OUTPUTS, runId ?? '', 'error', 'Validator skipped: contract is missing');
       return { error: 'ValidatorNode: contract is null' };
     }
 
     try {
       if (process.env.MOCK_MODE === 'true') {
-        this.streamEmitter.emit(projectId, 'validator', runId ?? '', 'decision', 'Mock mode: returning pass validation');
+        this.streamEmitter.emit(projectId, NODE.VALIDATE_OUTPUTS, runId ?? '', 'decision', 'Mock mode: returning pass validation');
       }
+      this.streamEmitter.progress(projectId, NODE.VALIDATE_OUTPUTS, runId ?? '', 50, 'Checking artifacts');
       const result = this.validate(state);
 
       if (result.valid) {
         this.logger.log(`[${state.projectId}] Validation passed`);
-        this.streamEmitter.emit(projectId, 'validator', runId ?? '', 'decision', 'Validation passed: all artifacts meet contract requirements');
+        this.streamEmitter.emit(projectId, NODE.VALIDATE_OUTPUTS, runId ?? '', 'decision', 'Validation passed: all artifacts meet contract requirements');
         return {};
       }
 
@@ -61,15 +77,15 @@ export class ValidatorNode {
         `[${state.projectId}] Validation failed: missing=${result.missingFiles.length}, syntax=${result.syntaxIssues.length}, type=${result.typeIssues.length}, schema=${result.schemaIssues.length}, integration=${result.integrationIssues.length}, contract=${result.contractIssues.length}`,
       );
 
-      this.streamEmitter.emit(projectId, 'validator', runId ?? '', 'decision', `Validation failed: ${result.missingFiles.length} missing files, ${result.syntaxIssues.length} syntax issues, ${result.typeIssues.length} type issues, ${result.schemaIssues.length} schema issues, ${result.integrationIssues.length} integration issues, ${result.contractIssues.length} contract issues`);
+      this.streamEmitter.emit(projectId, NODE.VALIDATE_OUTPUTS, runId ?? '', 'decision', `Validation failed: ${result.missingFiles.length} missing files, ${result.syntaxIssues.length} syntax issues, ${result.typeIssues.length} type issues, ${result.schemaIssues.length} schema issues, ${result.integrationIssues.length} integration issues, ${result.contractIssues.length} contract issues`);
 
       const validationIssueText = [
         ...result.missingFiles.map((f) => `MISSING FILE: ${f}`),
-        ...result.syntaxIssues.map((s) => `SYNTAX: ${s}`),
-        ...result.typeIssues.map((s) => `TYPE: ${s}`),
-        ...result.schemaIssues.map((s) => `SCHEMA: ${s}`),
-        ...result.integrationIssues.map((s) => `INTEGRATION: ${s}`),
-        ...result.contractIssues.map((s) => `CONTRACT: ${s}`),
+        ...result.syntaxIssues.map((s) => `SYNTAX: ${s} | Fix: ${ValidatorNode.FIX_SUGGESTIONS.TS_SYNTAX}`),
+        ...result.typeIssues.map((s) => `TYPE: ${s} | Fix: ${ValidatorNode.FIX_SUGGESTIONS.TS_TYPE}`),
+        ...result.schemaIssues.map((s) => `SCHEMA: ${s} | Fix: ${ValidatorNode.FIX_SUGGESTIONS.SCHEMA_VIOLATION}`),
+        ...result.integrationIssues.map((s) => `INTEGRATION: ${s} | Fix: ${ValidatorNode.FIX_SUGGESTIONS.CONTRACT}`),
+        ...result.contractIssues.map((s) => `CONTRACT: ${s} | Fix: Align acceptance criteria with generated artifacts`),
       ].join('\n');
 
       // Each failing agent gets feedback scoped to its own issues; this also
@@ -123,7 +139,7 @@ export class ValidatorNode {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       this.logger.error(`[${state.projectId}] Validator failed: ${message}`);
-      this.streamEmitter.emit(projectId, 'validator', runId ?? '', 'error', `Validation failed: ${humanReadableError(message)}`);
+      this.streamEmitter.emit(projectId, NODE.VALIDATE_OUTPUTS, runId ?? '', 'error', `Validation failed: ${humanReadableError(message)}`);
       return { error: `ValidatorNode failed: ${message}` };
     }
   }
@@ -278,40 +294,50 @@ export class ValidatorNode {
     for (const criterion of contract.acceptanceCriteria) {
       const lower = criterion.toLowerCase();
 
-      if (lower.includes('frontend') || lower.includes('ui') || lower.includes('component')) {
-        const hasFrontend = state.artifacts.some(
-          (a) => a.agentType === 'frontend' && a.content.trim().length > 50,
-        );
-        if (!hasFrontend) {
-          issues.push(`frontend: acceptance criterion "${criterion}" — no meaningful frontend artifacts`);
+      if (lower.includes('frontend') || lower.includes('ui') || lower.includes('component') || lower.includes('page')) {
+        const frontendArtifacts = state.artifacts.filter((a) => a.agentType === 'frontend');
+        const hasMeaningful = frontendArtifacts.some((a) => a.content.trim().length > 100);
+        const fileCount = frontendArtifacts.length;
+        if (!hasMeaningful) {
+          issues.push(`frontend: acceptance criterion "${criterion}" — no meaningful frontend artifacts (${fileCount} files, none >100 chars)`);
         }
       }
 
-      if (lower.includes('api') || lower.includes('endpoint') || lower.includes('backend')) {
-        const hasBackend = state.artifacts.some(
-          (a) => a.agentType === 'backend' && a.content.trim().length > 50,
-        );
-        if (!hasBackend) {
-          issues.push(`backend: acceptance criterion "${criterion}" — no meaningful backend artifacts`);
+      if (lower.includes('api') || lower.includes('endpoint') || lower.includes('route') || lower.includes('backend')) {
+        const backendArtifacts = state.artifacts.filter((a) => a.agentType === 'backend');
+        const hasController = backendArtifacts.some((a) => a.content.includes('@Controller') || a.content.includes('@Resolver'));
+        const hasService = backendArtifacts.some((a) => a.content.includes('@Injectable'));
+        if (!hasController) {
+          issues.push(`backend: acceptance criterion "${criterion}" — no controller found (expected @Controller decorator)`);
+        }
+        if (!hasService) {
+          issues.push(`backend: acceptance criterion "${criterion}" — no service found (expected @Injectable)`);
         }
       }
 
-      if (lower.includes('database') || lower.includes('schema') || lower.includes('model')) {
-        const hasDatabase = state.artifacts.some(
-          (a) => a.agentType === 'database' && a.content.trim().length > 50,
+      if (lower.includes('database') || lower.includes('schema') || lower.includes('model') || lower.includes('table')) {
+        const hasPrismaSchema = state.artifacts.some(
+          (a) => a.filePath.endsWith('schema.prisma') && a.content.trim().length > 100,
         );
-        if (!hasDatabase) {
-          issues.push(`database: acceptance criterion "${criterion}" — no meaningful database artifacts`);
+        const hasMigration = state.artifacts.some(
+          (a) => a.filePath.endsWith('.sql') && /CREATE\s+TABLE/i.test(a.content),
+        );
+        if (!hasPrismaSchema) {
+          issues.push(`database: acceptance criterion "${criterion}" — no Prisma schema file`);
+        }
+        if (!hasMigration) {
+          issues.push(`database: acceptance criterion "${criterion}" — no SQL migration with CREATE TABLE`);
         }
       }
 
-      if (lower.includes('documentation') || lower.includes('readme') || lower.includes('architecture')) {
-        const hasDocs = state.artifacts.some(
-          (a) => a.filePath.endsWith('.md') && a.content.trim().length > 50,
-        );
-        if (!hasDocs) {
-          issues.push(`architecture: acceptance criterion "${criterion}" — no meaningful documentation artifacts`);
-        }
+      if (lower.includes('documentation') || lower.includes('readme') || lower.includes('architecture') || lower.includes('docs')) {
+        const docFiles = state.artifacts.filter((a) => a.filePath.endsWith('.md'));
+        const hasArchitecture = docFiles.some((a) => a.filePath.includes('ARCHITECTURE'));
+        const hasApi = docFiles.some((a) => a.filePath.includes('API'));
+        const hasDeployment = docFiles.some((a) => a.filePath.includes('DEPLOYMENT'));
+        if (!hasArchitecture) issues.push(`architecture: acceptance criterion "${criterion}" — missing ARCHITECTURE.md`);
+        if (!hasApi) issues.push(`architecture: acceptance criterion "${criterion}" — missing API.md`);
+        if (!hasDeployment) issues.push(`architecture: acceptance criterion "${criterion}" — missing DEPLOYMENT.md`);
       }
     }
 

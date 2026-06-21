@@ -10,6 +10,7 @@ import { humanReadableError } from './human-readable-error';
 import { ARCHITECTURE_AGENT_SYSTEM, buildAgentSystemPrompt } from '../prompts/agent-prompts';
 import { resolveModelForNode } from '../providers/base-llm.provider';
 import { ProjectScaffolderService } from '../scaffolding/project-scaffolder.service';
+import { OutputValidationService } from '../output-validation/output-validation.service';
 
 @Injectable()
 export class ArchitectureAgentNode {
@@ -22,6 +23,7 @@ export class ArchitectureAgentNode {
     private readonly graphLlm: GraphLlmProvider,
     private readonly streamEmitter: StreamEmitter,
     private readonly scaffolder: ProjectScaffolderService,
+    private readonly outputValidation: OutputValidationService,
   ) {}
 
   async execute(
@@ -38,6 +40,7 @@ export class ArchitectureAgentNode {
     await this.eventLog.logStarted(projectId, 'architecture_agent');
 
     this.streamEmitter.emit(projectId, 'architecture_agent', runId ?? '', 'decision', 'Starting architecture documentation generation...');
+    this.streamEmitter.progress(projectId, 'architecture_agent', runId ?? '', 10, 'Loading context');
 
     try {
       const memoryQuery = [
@@ -73,12 +76,8 @@ export class ArchitectureAgentNode {
           state.contract.acceptanceCriteria,
         );
         if (isValid) {
-          this.logger.log(
-            `[${state.projectId}] Skip-generation: reusing architecture memory artifact (similarity=${skipCandidate.similarity?.toFixed(3)})`,
-          );
-          await this.memory.bumpUsageStats(skipCandidate.id);
           const rememberedFilePath = skipCandidate.metadata['filePath'];
-          const artifact: GeneratedArtifact = {
+          const candidateArtifact: GeneratedArtifact = {
             agentType: 'architecture',
             filePath:
               typeof rememberedFilePath === 'string'
@@ -88,7 +87,17 @@ export class ArchitectureAgentNode {
             language: 'markdown',
             source: 'skip',
           };
-          return { artifacts: [artifact] };
+          const validationErrors = this.outputValidation.validateBatch([candidateArtifact], state.projectId);
+          if (validationErrors.length === 0) {
+            this.logger.log(
+              `[${state.projectId}] Skip-generation: reusing architecture memory artifact (similarity=${skipCandidate.similarity?.toFixed(3)})`,
+            );
+            await this.memory.bumpUsageStats(skipCandidate.id);
+            return { artifacts: [candidateArtifact] };
+          }
+          this.logger.warn(
+            `[${state.projectId}] Skip candidate failed content validation (${validationErrors.length} errors), falling through to LLM generation`,
+          );
         }
         this.logger.log(
           `[${state.projectId}] Skip candidate failed acceptance validation, proceeding with LLM generation`,
@@ -114,6 +123,7 @@ export class ArchitectureAgentNode {
         return { artifacts, validationFeedback: null };
       }
 
+      this.streamEmitter.progress(projectId, 'architecture_agent', runId ?? '', 40, 'Generating docs');
       this.streamEmitter.emit(projectId, 'architecture_agent', runId ?? '', 'decision', `Calling LLM (${this.graphLlm.model()}) to generate architecture docs...`);
 
       const feedbackContext = state.validationFeedback
@@ -198,6 +208,7 @@ Generate these 3 documentation files:
         skipDuplicates: true,
       }).catch(() => {});
 
+      this.streamEmitter.progress(projectId, 'architecture_agent', runId ?? '', 95, 'Saving artifacts');
       this.streamEmitter.emit(projectId, 'architecture_agent', runId ?? '', 'decision', `Architecture documentation complete: ${artifacts.length} files generated (${result.usage.outputTokens} output tokens)`);
 
       return { artifacts, validationFeedback: null };
