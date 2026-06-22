@@ -179,13 +179,157 @@ JSON schema:
 
 The content field must contain the complete generated file content as a string, not a summary or truncated output. Every function, class, and import must be fully present and syntactically valid.`;
 
+/**
+ * Builds structured memory context from the layered agent memories, separating
+ * conventions, examples, and mistakes into distinct prompt sections so the LLM
+ * treats them as authoritative project context rather than vague hints.
+ */
+export function buildStructuredMemoryContext(
+  layers: {
+    projectCore?: Array<{ content: string }>;
+    projectAgent?: Array<{ content: string }>;
+    agentPrivate?: Array<{ content: string }>;
+    mistakes?: Array<{ content: string }>;
+    globalPatterns?: Array<{ content: string }>;
+  },
+): string {
+  const sections: string[] = [];
+
+  if (layers.projectCore?.length) {
+    sections.push(
+      'PROJECT CONVENTIONS (approved — your output MUST follow these):',
+      ...layers.projectCore.map((m) => `• ${m.content.slice(0, 600)}`),
+    );
+  }
+
+  if (layers.globalPatterns?.length) {
+    sections.push(
+      'PROVEN PATTERNS FOR THIS STACK (apply these techniques):',
+      ...layers.globalPatterns.map((m) => `• ${m.content.slice(0, 600)}`),
+    );
+  }
+
+  if (layers.agentPrivate?.length) {
+    sections.push(
+      'YOUR RELEVANT SKILLS (leverage these):',
+      ...layers.agentPrivate.map((m) => `• ${m.content.slice(0, 400)}`),
+    );
+  }
+
+  if (layers.mistakes?.length) {
+    sections.push(
+      'PAST MISTAKES TO AVOID (you failed on these before — do NOT repeat):',
+      ...layers.mistakes.map((m) => `• ${m.content.slice(0, 400)}`),
+    );
+  }
+
+  return sections.join('\n');
+}
+
+/**
+ * Builds a contract summary from backend/database artifacts for injection
+ * into frontend/architecture agents, so they know exactly what the backend exposes.
+ */
+export function buildContractSummary(
+  backendArtifacts: Array<{ filePath: string; content: string }>,
+  databaseArtifacts: Array<{ filePath: string; content: string }>,
+): string {
+  const parts: string[] = [];
+
+  // Extract backend route signatures
+  const routes: string[] = [];
+  for (const artifact of backendArtifacts) {
+    const controllerMatch = artifact.content.match(
+      /@Controller\(\s*['"`]([^'"`]*)['"`]\s*\)/,
+    );
+    const base = controllerMatch?.[1] ?? '';
+    const methodRe =
+      /@(Get|Post|Put|Patch|Delete)\(\s*['"`]([^'"`]*)['"`]\s*\)/g;
+    let m: RegExpExecArray | null;
+    while ((m = methodRe.exec(artifact.content)) !== null) {
+      const path = base ? `/${base}/${m[2]}`.replace(/\/+/g, '/') : `/${m[2]}`;
+      routes.push(`${m[1].toUpperCase()} ${path}`);
+    }
+  }
+  if (routes.length > 0) {
+    parts.push(
+      'BACKEND ROUTES (frontend API calls must target these):',
+      ...routes.map((r) => `• ${r}`),
+    );
+  }
+
+  // Extract Prisma model shapes from database artifacts
+  const models: string[] = [];
+  for (const artifact of databaseArtifacts) {
+    const modelRe = /model\s+(\w+)\s*\{([^}]*)\}/g;
+    let m: RegExpExecArray | null;
+    while ((m = modelRe.exec(artifact.content)) !== null) {
+      const name = m[1];
+      const body = m[2];
+      const fields = body
+        .split('\n')
+        .map((l) => l.trim())
+        .filter((l) => l && !l.startsWith('//') && !l.startsWith('@@'))
+        .map((l) => l.split(/\s+/).slice(0, 2).join(': '))
+        .filter((f) => f.includes(':'));
+      if (fields.length > 0) {
+        models.push(`${name} { ${fields.join(', ')} }`);
+      }
+    }
+  }
+  if (models.length > 0) {
+    parts.push(
+      'DATABASE MODELS (use these exact names/types in your code):',
+      ...models.map((m) => `• ${m}`),
+    );
+  }
+
+  // Extract DTO shapes from backend artifacts
+  const dtos: string[] = [];
+  for (const artifact of backendArtifacts) {
+    const dtoRe = /export\s+(?:class|interface)\s+(\w*(?:Dto|DTO|Input|Request))\s*\{([^}]*)\}/g;
+    let m: RegExpExecArray | null;
+    while ((m = dtoRe.exec(artifact.content)) !== null) {
+      const name = m[1];
+      const body = m[2];
+      const fields = body
+        .split('\n')
+        .map((l) => l.trim())
+        .filter((l) => l && !l.startsWith('//'))
+        .map((l) => l.split(/\s+/).slice(0, 2).join(': '))
+        .filter((f) => f.includes(':'));
+      if (fields.length > 0) {
+        dtos.push(`${name} { ${fields.join(', ')} }`);
+      }
+    }
+  }
+  if (dtos.length > 0) {
+    parts.push(
+      'DTO CONTRACTS (match these field names/types in frontend):',
+      ...dtos.map((d) => `• ${d}`),
+    );
+  }
+
+  return parts.join('\n');
+}
+
 export function buildAgentSystemPrompt(
   basePrompt: string,
   memoryContext: string,
   artifactManifest?: string,
   previousFeedback?: string,
+  contractSummary?: string,
+  projectExamples?: string,
 ): string {
   const parts = [basePrompt];
+
+  if (contractSummary) {
+    parts.push(
+      '',
+      'CROSS-AGENT CONTRACT (generated by sibling agents — your output MUST integrate with these):',
+      contractSummary,
+    );
+  }
 
   if (artifactManifest) {
     parts.push(
@@ -195,8 +339,16 @@ export function buildAgentSystemPrompt(
     );
   }
 
+  if (projectExamples) {
+    parts.push(
+      '',
+      'REFERENCE EXAMPLES from this project (match these patterns and quality):',
+      projectExamples,
+    );
+  }
+
   if (memoryContext) {
-    parts.push('', 'Relevant layered memory:', memoryContext);
+    parts.push('', memoryContext);
   }
 
   if (previousFeedback) {

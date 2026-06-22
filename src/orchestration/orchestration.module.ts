@@ -11,6 +11,7 @@ import { FrontendAgentNode } from './nodes/frontend-agent.node';
 import { BackendAgentNode } from './nodes/backend-agent.node';
 import { DatabaseAgentNode } from './nodes/database-agent.node';
 import { ArchitectureAgentNode } from './nodes/architecture-agent.node';
+import { SelfCritiqueNode } from './nodes/self-critique.node';
 import { ValidatorNode } from './nodes/validator.node';
 import { GithubCommitNode } from './nodes/github-commit.node';
 import { AgentProviderRegistry } from './providers/agent-provider.registry';
@@ -43,6 +44,7 @@ import { OutputValidationService } from './output-validation/output-validation.s
     BackendAgentNode,
     DatabaseAgentNode,
     ArchitectureAgentNode,
+    SelfCritiqueNode,
     ValidatorNode,
     GithubCommitNode,
     AgentProviderRegistry,

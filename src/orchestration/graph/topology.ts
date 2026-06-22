@@ -19,6 +19,7 @@ export const NODE = {
   BACKEND_AGENT: 'backend_agent',
   DATABASE_AGENT: 'database_agent',
   ARCHITECTURE_AGENT: 'architecture_agent',
+  SELF_CRITIQUE: 'self_critique',
   VALIDATE_OUTPUTS: 'validate_outputs',
   GATE_2_CHECK: 'gate_2_check',
   COMMIT_TO_GITHUB: 'commit_to_github',
@@ -100,11 +101,17 @@ export interface NodeProviderSelector {
 /**
  * Resolves an optional per-node provider/model override. Configure via the
  * `NODE_PROVIDER_OVERRIDES` env var (JSON map keyed by node name), e.g.
- *   NODE_PROVIDER_OVERRIDES={"backend_agent":{"model":"claude-opus-4-8"}}
+ *   NODE_PROVIDER_OVERRIDES={"backend_agent":{"model":"claude-opus-4-8"},"self_critique":{"model":"gpt-4.1"}}
  *
  * Returns null when no override applies — callers fall back to the global
  * provider/model. This is the mechanism; nodes opt in by consulting it when
  * they build their LLM request. Default behavior is unchanged.
+ *
+ * Recommended per-node overrides for quality:
+ *  - negotiate_contract: use a stronger model (drives all downstream output)
+ *  - self_critique: use a strong model for thorough review
+ *  - architecture_agent: use a strong model for better docs
+ *  - code agents (frontend/backend/database): flash models are fine for speed
  */
 export function resolveNodeProvider(nodeName: string): NodeProviderSelector | null {
   const raw = process.env.NODE_PROVIDER_OVERRIDES;

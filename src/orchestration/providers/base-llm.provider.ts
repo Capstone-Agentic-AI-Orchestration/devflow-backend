@@ -100,10 +100,13 @@ export abstract class BaseLlmProvider {
    * truncates generated files mid-content) and Anthropic rejects the request
    * outright because `max_tokens` is required. Configurable via
    * `LLM_MAX_OUTPUT_TOKENS`.
+   *
+   * Increased from 8192 to 16384 to reduce truncation of large generated files
+   * (multi-file code generation often exceeds 8K tokens).
    */
   defaultMaxTokens(): number {
     const parsed = Number.parseInt(process.env.LLM_MAX_OUTPUT_TOKENS ?? '', 10);
-    return Number.isFinite(parsed) && parsed > 0 ? parsed : 8192;
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 16384;
   }
 
   fallbackModel(): string | null {

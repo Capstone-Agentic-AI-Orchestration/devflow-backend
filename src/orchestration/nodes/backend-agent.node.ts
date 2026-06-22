@@ -7,7 +7,7 @@ import { GraphLlmProvider } from '../providers/graph-llm.provider';
 import { PrismaService } from '../../prisma/prisma.service';
 import { StreamEmitter } from '../streaming/stream-emitter.service';
 import { humanReadableError } from './human-readable-error';
-import { BACKEND_AGENT_SYSTEM, buildAgentSystemPrompt } from '../prompts/agent-prompts';
+import { BACKEND_AGENT_SYSTEM, buildAgentSystemPrompt, buildStructuredMemoryContext } from '../prompts/agent-prompts';
 import { resolveModelForNode } from '../providers/base-llm.provider';
 import { ProjectScaffolderService } from '../scaffolding/project-scaffolder.service';
 import { OutputValidationService } from '../output-validation/output-validation.service';
@@ -145,11 +145,21 @@ export class BackendAgentNode {
         ? `Your previous attempt had these validation issues. Fix them in your new output:\n${state.validationFeedback}`
         : '';
 
+      const structuredMemory = buildStructuredMemoryContext(memoryBundle.layers);
+
+      const selfCritiqueFeedback = state.selfCritique
+        ? `Self-review found these quality issues before validation — address them:\n${state.selfCritique}`
+        : '';
+
+      const combinedFeedback = [feedbackContext, selfCritiqueFeedback]
+        .filter(Boolean)
+        .join('\n\n');
+
       const systemPrompt = buildAgentSystemPrompt(
         BACKEND_AGENT_SYSTEM,
-        memoryContext,
+        structuredMemory,
         artifactManifest,
-        feedbackContext,
+        combinedFeedback || undefined,
       );
 
       const result = await this.graphLlm.generateJson<Array<{

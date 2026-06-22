@@ -23,6 +23,7 @@ import { DatabaseAgentNode } from './nodes/database-agent.node';
 import { ArchitectureAgentNode } from './nodes/architecture-agent.node';
 import { ValidatorNode } from './nodes/validator.node';
 import { GithubCommitNode } from './nodes/github-commit.node';
+import { SelfCritiqueNode } from './nodes/self-critique.node';
 import { MemoryService } from '../memory/memory.service';
 import { DevFlowGateway } from '../gateway/devflow.gateway';
 import { NotificationsService } from '../notifications/notifications.service';
@@ -256,6 +257,7 @@ export class OrchestrationService implements OnModuleInit {
     private readonly backendAgent: BackendAgentNode,
     private readonly databaseAgent: DatabaseAgentNode,
     private readonly architectureAgent: ArchitectureAgentNode,
+    private readonly selfCritique: SelfCritiqueNode,
     private readonly validator: ValidatorNode,
     private readonly githubCommit: GithubCommitNode,
     private readonly memory: MemoryService,
@@ -421,6 +423,7 @@ Rough idea: ${input.brief}`;
       this.backendAgent,
       this.databaseAgent,
       this.architectureAgent,
+      this.selfCritique,
       this.validator,
       this.githubCommit,
       this.prisma,

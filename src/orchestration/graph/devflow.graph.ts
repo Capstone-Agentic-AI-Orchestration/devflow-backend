@@ -16,6 +16,7 @@ import { DatabaseAgentNode } from '../nodes/database-agent.node';
 import { ArchitectureAgentNode } from '../nodes/architecture-agent.node';
 import { ValidatorNode } from '../nodes/validator.node';
 import { GithubCommitNode } from '../nodes/github-commit.node';
+import { SelfCritiqueNode } from '../nodes/self-critique.node';
 import { PrismaService } from '../../prisma/prisma.service';
 import { OrchestrationEmitter } from '../streaming/orchestration-emitter.service';
 import { NODE, gate1Router, validatorRouter, gate2Router } from './topology';
@@ -45,6 +46,7 @@ export interface DevFlowNodeImpls {
   [NODE.BACKEND_AGENT]: NodeImpl;
   [NODE.DATABASE_AGENT]: NodeImpl;
   [NODE.ARCHITECTURE_AGENT]: NodeImpl;
+  [NODE.SELF_CRITIQUE]: NodeImpl;
   [NODE.VALIDATE_OUTPUTS]: NodeImpl;
   [NODE.COMMIT_TO_GITHUB]: NodeImpl;
 }
@@ -109,6 +111,7 @@ export function buildGraph(
   addProcessingNode(NODE.BACKEND_AGENT);
   addProcessingNode(NODE.DATABASE_AGENT);
   addProcessingNode(NODE.ARCHITECTURE_AGENT);
+  addProcessingNode(NODE.SELF_CRITIQUE);
   addProcessingNode(NODE.VALIDATE_OUTPUTS);
   addProcessingNode(NODE.COMMIT_TO_GITHUB);
 
@@ -187,10 +190,14 @@ export function buildGraph(
   // validate_outputs via the artifacts append reducer.
   graph.addConditionalEdges(NODE.GATE_1_CHECK, gate1Router);
 
-  graph.addEdge(NODE.FRONTEND_AGENT, NODE.VALIDATE_OUTPUTS);
-  graph.addEdge(NODE.BACKEND_AGENT, NODE.VALIDATE_OUTPUTS);
-  graph.addEdge(NODE.DATABASE_AGENT, NODE.VALIDATE_OUTPUTS);
-  graph.addEdge(NODE.ARCHITECTURE_AGENT, NODE.VALIDATE_OUTPUTS);
+  // Code agents fan-in to self_critique (which accumulates all artifacts via reducer)
+  graph.addEdge(NODE.FRONTEND_AGENT, NODE.SELF_CRITIQUE);
+  graph.addEdge(NODE.BACKEND_AGENT, NODE.SELF_CRITIQUE);
+  graph.addEdge(NODE.DATABASE_AGENT, NODE.SELF_CRITIQUE);
+  graph.addEdge(NODE.ARCHITECTURE_AGENT, NODE.SELF_CRITIQUE);
+
+  // Self-critique → validate_outputs
+  graph.addEdge(NODE.SELF_CRITIQUE, NODE.VALIDATE_OUTPUTS);
 
   // Validation → parallel retry fan-out to failing agents (retryPlan) or Gate 2.
   graph.addConditionalEdges(NODE.VALIDATE_OUTPUTS, validatorRouter);
@@ -221,6 +228,7 @@ export function buildDevFlowGraph(
   backendAgent: BackendAgentNode,
   databaseAgent: DatabaseAgentNode,
   architectureAgent: ArchitectureAgentNode,
+  selfCritique: SelfCritiqueNode,
   validator: ValidatorNode,
   githubCommit: GithubCommitNode,
   prisma: PrismaService,
@@ -234,6 +242,7 @@ export function buildDevFlowGraph(
     [NODE.BACKEND_AGENT]: (state) => backendAgent.execute(state),
     [NODE.DATABASE_AGENT]: (state) => databaseAgent.execute(state),
     [NODE.ARCHITECTURE_AGENT]: (state) => architectureAgent.execute(state),
+    [NODE.SELF_CRITIQUE]: (state) => selfCritique.execute(state),
     [NODE.VALIDATE_OUTPUTS]: (state) => validator.execute(state),
     [NODE.COMMIT_TO_GITHUB]: (state) => githubCommit.execute(state),
   };

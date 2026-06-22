@@ -90,7 +90,12 @@ export class ValidatorNode {
 
       // Each failing agent gets feedback scoped to its own issues; this also
       // drives which agents are re-run and which mistakes are remembered.
-      const retryPlan = this.buildRetryPlan(result, validationIssueText);
+      const retryPlan = this.buildRetryPlan(
+        result,
+        validationIssueText,
+        state.artifacts,
+        state.contract,
+      );
       const impliedAgents = retryPlan.map((d) => d.agentType);
 
       const stackKey = state.stackKey ?? 'unknown';
@@ -203,18 +208,58 @@ export class ValidatorNode {
   /**
    * Builds one retry directive per failing agent, each carrying feedback scoped
    * to that agent's own issues, so a parallel fan-out re-runs exactly the agents
-   * that failed. Falls back to a single frontend directive carrying the full
-   * issue text if nothing could be attributed (defensive — should not occur once
-   * validation has failed).
+   * that failed. Includes the actual artifact content that failed and relevant
+   * acceptance criteria so the LLM can see what it generated and what needs to
+   * change. Falls back to a single frontend directive carrying the full issue
+   * text if nothing could be attributed.
    */
   private buildRetryPlan(
     result: ValidationResult,
     fallbackFeedback: string,
+    artifacts: Array<{ agentType: string; filePath: string; content: string }>,
+    contract: { acceptanceCriteria: string[] } | null,
   ): RetryDirective[] {
     const plan: RetryDirective[] = [];
+
     for (const [agentType, issues] of result.agentIssues) {
-      plan.push({ agentType, feedback: issues.join('\n') });
+      // Get the failing artifacts for this agent
+      const agentArtifacts = artifacts
+        .filter((a) => a.agentType === agentType)
+        .slice(0, 3)
+        .map((a) => {
+          const excerpt = a.content.slice(0, 1000);
+          return `--- ${a.filePath} (current output, ${a.content.length} chars) ---\n${excerpt}${a.content.length > 1000 ? '\n...(truncated)' : ''}`;
+        })
+        .join('\n\n');
+
+      // Get relevant acceptance criteria for this agent type
+      const relevantCriteria = (contract?.acceptanceCriteria ?? [])
+        .filter((c) => {
+          const lower = c.toLowerCase();
+          if (agentType === 'frontend') return lower.includes('frontend') || lower.includes('ui') || lower.includes('component') || lower.includes('page');
+          if (agentType === 'backend') return lower.includes('api') || lower.includes('endpoint') || lower.includes('route') || lower.includes('backend');
+          if (agentType === 'database') return lower.includes('database') || lower.includes('schema') || lower.includes('model') || lower.includes('table');
+          if (agentType === 'architecture') return lower.includes('documentation') || lower.includes('readme') || lower.includes('architecture');
+          return false;
+        })
+        .map((c) => `• ${c}`);
+
+      const feedbackParts = [
+        'VALIDATION ERRORS (fix every one):',
+        ...issues.map((i) => `• ${i}`),
+      ];
+
+      if (relevantCriteria.length > 0) {
+        feedbackParts.push('', 'RELEVANT ACCEPTANCE CRITERIA (your output must satisfy these):', ...relevantCriteria);
+      }
+
+      if (agentArtifacts) {
+        feedbackParts.push('', 'YOUR CURRENT OUTPUT (fix this, do not regenerate from scratch):', agentArtifacts);
+      }
+
+      plan.push({ agentType, feedback: feedbackParts.join('\n') });
     }
+
     if (plan.length === 0) {
       plan.push({ agentType: 'frontend', feedback: fallbackFeedback });
     }

@@ -64,9 +64,9 @@ describe('BaseLlmProvider max_tokens budget', () => {
     }
   });
 
-  it('defaults to 8192 output tokens when unset', () => {
+  it('defaults to 16384 output tokens when unset', () => {
     delete process.env.LLM_MAX_OUTPUT_TOKENS;
-    expect(new TestProvider('openrouter').defaultMaxTokens()).toBe(8192);
+    expect(new TestProvider('openrouter').defaultMaxTokens()).toBe(16384);
   });
 
   it('respects a valid LLM_MAX_OUTPUT_TOKENS override', () => {
@@ -76,19 +76,19 @@ describe('BaseLlmProvider max_tokens budget', () => {
 
   it('ignores invalid LLM_MAX_OUTPUT_TOKENS values', () => {
     process.env.LLM_MAX_OUTPUT_TOKENS = 'not-a-number';
-    expect(new TestProvider('openrouter').defaultMaxTokens()).toBe(8192);
+    expect(new TestProvider('openrouter').defaultMaxTokens()).toBe(16384);
   });
 
   it('always includes max_tokens for non-anthropic providers even when caller omits it', () => {
     delete process.env.LLM_MAX_OUTPUT_TOKENS;
     const body = new TestProvider('openrouter').build(baseOptions);
-    expect(body.max_tokens).toBe(8192);
+    expect(body.max_tokens).toBe(16384);
   });
 
   it('always includes max_tokens for anthropic (which requires it)', () => {
     delete process.env.LLM_MAX_OUTPUT_TOKENS;
     const body = new TestProvider('anthropic').build(baseOptions);
-    expect(body.max_tokens).toBe(8192);
+    expect(body.max_tokens).toBe(16384);
   });
 
   it('honors an explicit caller-provided maxTokens over the default', () => {

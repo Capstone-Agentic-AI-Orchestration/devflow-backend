@@ -47,6 +47,8 @@ export function checkIntegration(
   const errors: ValidationError[] = [];
   errors.push(...checkFrontendToBackend(artifacts));
   errors.push(...checkBackendToDatabase(artifacts));
+  errors.push(...checkDtoConsistency(artifacts));
+  errors.push(...checkAuthGuardPresence(artifacts));
   return errors;
 }
 
@@ -132,6 +134,103 @@ function checkBackendToDatabase(
   }
 
   return errors;
+}
+
+// ─── DTO Consistency ──────────────────────────────────────────────────────────
+
+/**
+ * Checks that DTOs referenced in frontend form fields / request bodies match
+ * the DTO classes defined in backend artifacts. Catches mismatches between
+ * what the frontend sends and what the backend expects.
+ */
+function checkDtoConsistency(
+  artifacts: IntegrationArtifact[],
+): ValidationError[] {
+  const backendFiles = artifacts.filter((a) => a.agentType === 'backend');
+  const frontendFiles = artifacts.filter((a) => a.agentType === 'frontend');
+  if (backendFiles.length === 0 || frontendFiles.length === 0) return [];
+
+  // Extract backend DTO field names
+  const dtoFields = new Map<string, Set<string>>();
+  for (const file of backendFiles) {
+    const dtoRe = /(?:class|interface)\s+(\w*(?:Dto|DTO|Input|Request))\s*\{([^}]*)\}/g;
+    let m: RegExpExecArray | null;
+    while ((m = dtoRe.exec(file.content)) !== null) {
+      const name = m[1];
+      const body = m[2];
+      const fields = new Set<string>();
+      const fieldRe = /(?:readonly\s+|public\s+|private\s+)?(\w+)\s*[:?]/g;
+      let fm: RegExpExecArray | null;
+      while ((fm = fieldRe.exec(body)) !== null) {
+        fields.add(fm[1].toLowerCase());
+      }
+      if (fields.size > 0) dtoFields.set(name.toLowerCase(), fields);
+    }
+  }
+  if (dtoFields.size === 0) return [];
+
+  // Check frontend for form field names / request body shapes that don't match any DTO
+  const errors: ValidationError[] = [];
+  const seen = new Set<string>();
+
+  for (const file of frontendFiles) {
+    // Check for form submission field names
+    const formFieldRe = /(?:name|id)\s*[:=]\s*['"`]([a-zA-Z_][a-zA-Z0-9_]*)['"`]/g;
+    let m: RegExpExecArray | null;
+    while ((m = formFieldRe.exec(file.content)) !== null) {
+      const field = m[1].toLowerCase();
+      if (seen.has(field)) continue;
+      // Check if any DTO has this field
+      const inAnyDto = [...dtoFields.values()].some((fields) => fields.has(field));
+      if (!inAnyDto && field.length > 2 && !/^(submit|reset|button|form|input|select|textarea|email|password|text|hidden|search)$/.test(field)) {
+        seen.add(field);
+        errors.push({
+          code: 'CONTRACT',
+          agentType: 'frontend',
+          path: file.filePath,
+          message: `frontend references field "${m[1]}" but no backend DTO declares this field (backend DTOs: ${[...dtoFields.keys()].slice(0, 5).join(', ')})`,
+        });
+        if (errors.length >= MAX_ISSUES_PER_CHECK) return errors;
+      }
+    }
+  }
+
+  return errors;
+}
+
+// ─── Auth Guard Presence ──────────────────────────────────────────────────────
+
+/**
+ * Checks that if backend controllers define protected routes (with @UseGuards,
+ * @Roles, or auth-related decorators), there's a corresponding auth guard
+ * implementation in the artifacts.
+ */
+function checkAuthGuardPresence(
+  artifacts: IntegrationArtifact[],
+): ValidationError[] {
+  const backendFiles = artifacts.filter((a) => a.agentType === 'backend');
+  if (backendFiles.length === 0) return [];
+
+  const hasAuthDecorator = backendFiles.some((f) =>
+    /@(?:UseGuards|Roles|ApiBearerAuth|RequireAuth)/.test(f.content),
+  );
+  if (!hasAuthDecorator) return [];
+
+  const hasAuthGuard = backendFiles.some((f) =>
+    /(?:AuthGuard|CanActivate|guard\.ts|auth\.guard)/i.test(f.filePath) ||
+    /implements\s+CanActivate/.test(f.content),
+  );
+
+  if (!hasAuthGuard) {
+    return [{
+      code: 'CONTRACT',
+      agentType: 'backend',
+      path: backendFiles[0].filePath,
+      message: 'backend uses auth decorators (@UseGuards/@Roles/@ApiBearerAuth) but no auth guard implementation was found in the generated artifacts',
+    }];
+  }
+
+  return [];
 }
 
 // ─── Extraction helpers ─────────────────────────────────────────────────────────

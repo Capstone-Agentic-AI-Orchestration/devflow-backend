@@ -189,6 +189,14 @@ export function buildSimulationNodeImpls(
       };
     },
 
+    [NODE.SELF_CRITIQUE]: async (state) => {
+      await play(emitter, state, NODE.SELF_CRITIQUE, [
+        { type: 'decision', text: 'Reviewing artifacts against contract…', pct: 50 },
+        { type: 'decision', text: 'Self-critique passed.', pct: 100 },
+      ]);
+      return {};
+    },
+
     [NODE.VALIDATE_OUTPUTS]: async (state) => {
       await play(emitter, state, NODE.VALIDATE_OUTPUTS, [
         { type: 'decision', text: 'Checking artifacts against the contract…', pct: 50 },

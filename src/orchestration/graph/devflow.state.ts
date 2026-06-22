@@ -150,6 +150,26 @@ export const DevFlowState = Annotation.Root({
     default: () => [],
     reducer: (_, next) => next,
   }),
+
+  /**
+   * Cross-agent contract summary extracted from backend/database artifacts.
+   * Injected into frontend/architecture agents so they know exactly what the
+   * backend exposes (routes, DTOs, Prisma models).
+   */
+  contractSummary: Annotation<string>({
+    default: () => '',
+    reducer: (_, next) => next,
+  }),
+
+  /**
+   * Self-critique feedback from the review node. Contains quality issues
+   * found by having the LLM review its own output against the contract
+   * before formal validation runs.
+   */
+  selfCritique: Annotation<string>({
+    default: () => '',
+    reducer: (_, next) => next,
+  }),
 });
 
 export type DevFlowStateType = typeof DevFlowState.State;
