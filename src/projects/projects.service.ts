@@ -393,12 +393,25 @@ export class ProjectsService {
       return { accepted: true, runId: project.runId };
     }
 
-    if (project.kickoff?.status !== ProjectKickoffStatus.READY && project.kickoff?.status !== ProjectKickoffStatus.LOCKED) {
-      throw new BadRequestException('Project kickoff must be complete before orchestration can start');
+    // Self-provision run prerequisites so a fresh project can start with one click:
+    // seed starter work orders when none are READY, then mark the kickoff ready.
+    if (!project.workOrders.some((workOrder) => workOrder.instructions?.trim())) {
+      await this.createKickoffWorkOrders(id, user);
     }
 
-    if (!project.workOrders.some((workOrder) => workOrder.instructions?.trim())) {
-      throw new BadRequestException('At least one READY work order with instructions is required before orchestration can start');
+    if (project.kickoff?.status !== ProjectKickoffStatus.READY && project.kickoff?.status !== ProjectKickoffStatus.LOCKED) {
+      await this.updateKickoffRecord(id, user, {
+        scopeSummary: project.brief,
+        techStackNotes: project.stackKey,
+        scopeConfirmed: true,
+        milestonesConfirmed: true,
+        documentsConfirmed: true,
+        techStackConfirmed: true,
+        rolesConfirmed: true,
+        clientAccessConfirmed: true,
+        initialTasksCreated: true,
+        initialWorkOrdersCreated: true,
+      });
     }
 
     const runId = await this.orchestration.startRun(
@@ -2830,7 +2843,7 @@ export class ProjectsService {
     > = {
       APPROVED: {
         label: 'Approved',
-        nextAction: 'Create kickoff',
+        nextAction: 'Start orchestration',
         tone: 'gray',
         progress: 10,
       },
@@ -2842,7 +2855,7 @@ export class ProjectsService {
       },
       KICKOFF: {
         label: 'Kickoff',
-        nextAction: 'Complete kickoff',
+        nextAction: 'Start orchestration',
         tone: 'blue',
         progress: 35,
       },

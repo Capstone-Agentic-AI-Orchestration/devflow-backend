@@ -13,7 +13,7 @@ import type { RunnableConfig } from '@langchain/core/runnables';
 import { createCheckpointer } from './graph/checkpointer';
 import { buildDevFlowGraph, buildGraph } from './graph/devflow.graph';
 import { buildSimulationNodeImpls } from './graph/simulation-nodes';
-import { DevFlowStateType } from './graph/devflow.state';
+import { DevFlowStateType, ProjectContract } from './graph/devflow.state';
 import { PrismaService } from '../prisma/prisma.service';
 import { RequirementsParserNode } from './nodes/requirements-parser.node';
 import { ContractNegotiatorNode } from './nodes/contract-negotiator.node';
@@ -81,6 +81,8 @@ export interface OrchestrationStatus {
   currentNode: string;
   retryCount: number;
   error: string | null;
+  /** Architecture contract from graph state, so Gate 1 review can show what is being approved. */
+  contract?: ProjectContract | null;
 }
 
 // ─── Mid-run control (Phase 2) ──────────────────────────────────────────────
@@ -931,6 +933,7 @@ Rough idea: ${input.brief}`;
         currentNode: this.getCurrentNode(checkpoint),
         retryCount: channelValues?.retryCount ?? 0,
         error: publicError,
+        contract: channelValues?.contract ?? null,
       };
     } catch {
       return {

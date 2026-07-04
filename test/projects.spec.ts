@@ -270,7 +270,7 @@ describe('ProjectsService', () => {
     ).rejects.toBeInstanceOf(NotFoundException);
   });
 
-  it('startOrchestration blocks until kickoff is ready', async () => {
+  it('startOrchestration self-provisions a draft kickoff and starts the run', async () => {
     prisma.project.findFirst.mockResolvedValue({
       id: 'project-1',
       companyName: 'Acme Logistics',
@@ -280,11 +280,47 @@ describe('ProjectsService', () => {
       kickoff: { status: ProjectKickoffStatus.DRAFT },
       workOrders: [{ instructions: 'Build the first dashboard shell.' }],
     });
+    prisma.projectKickoff.upsert.mockResolvedValue({
+      id: 'kickoff-1',
+      status: ProjectKickoffStatus.READY,
+    });
 
-    await expect(
-      service.startOrchestration('project-1', pmUser),
-    ).rejects.toBeInstanceOf(BadRequestException);
-    expect(orchestration.startRun).not.toHaveBeenCalled();
+    await expect(service.startOrchestration('project-1', pmUser)).resolves.toEqual({
+      accepted: true,
+      runId: 'run-1',
+    });
+    expect(prisma.projectKickoff.upsert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        update: expect.objectContaining({ status: ProjectKickoffStatus.READY }),
+      }),
+    );
+    expect(orchestration.startRun).toHaveBeenCalled();
+  });
+
+  it('startOrchestration seeds starter work orders when none are ready', async () => {
+    prisma.project.findFirst.mockResolvedValue({
+      id: 'project-1',
+      companyName: 'Acme Logistics',
+      brief: 'Build a delivery dashboard',
+      stackKey: 'nextjs-nestjs-supabase',
+      runId: null,
+      kickoff: { status: ProjectKickoffStatus.READY },
+      workOrders: [],
+    });
+    prisma.workOrder.create.mockImplementation(({ data }) =>
+      Promise.resolve({ id: `wo-${data.title}`, ...data }),
+    );
+    prisma.projectKickoff.upsert.mockResolvedValue({
+      id: 'kickoff-1',
+      status: ProjectKickoffStatus.READY,
+    });
+
+    await expect(service.startOrchestration('project-1', pmUser)).resolves.toEqual({
+      accepted: true,
+      runId: 'run-1',
+    });
+    expect(prisma.workOrder.create).toHaveBeenCalled();
+    expect(orchestration.startRun).toHaveBeenCalled();
   });
 
   it('verifyOrchestrationGithubDelivery checks project access before live GitHub verification', async () => {
